@@ -1,0 +1,349 @@
+#include "runtime/machine.h"
+
+#include <climits>
+#include <cstdio>
+#include <cstdlib>
+
+#include "runtime/nes_palette.h"
+
+// Generated table: g_bank_fns[bank] = bank_NN (or nullptr for data-only banks).
+#include "bank_table.inc"
+
+namespace {
+constexpr int kLinesPerFrame = 262;
+constexpr int kVisibleLines = 240;
+constexpr int kVblankLine = 241;
+constexpr int kPrerenderLine = 261;
+// Approximate CPU cycle (of 113.67 per line) at which the MMC3 sees A12 rise:
+// PPU dot 260 of the line.
+constexpr int64_t kMmc3ClockOffset = 87;
+}  // namespace
+
+// ---------------------------------------------------------------- lifecycle
+
+void Machine::reset() {
+    apu.read_cpu = [this](uint16_t addr) { return rd(addr); };  // DMC sample fetches
+    prg_mode = 0;
+    chr_inv = 0;
+    mmc3_sel = 0;
+    for (auto& r : mmc3_r) r = 0;
+    update_mmc3_banks();
+    s = 0xFD;
+    p = 0x24;
+    cyc = 0;
+    evt = 0;
+    line_g = 0;
+    next_line_t = 0;
+    irq_armed = false;
+    irq_line = false;
+    nmi_pending = false;
+    pc = rd16(0xFFFC);
+}
+
+// ---------------------------------------------------------------- I/O space
+
+uint8_t Machine::rd_io(uint16_t addr) {
+    if (addr < 0x4000) {
+        switch (addr & 7) {
+            case 2: {  // PPUSTATUS
+                uint8_t st = static_cast<uint8_t>((vblank ? 0x80 : 0) | (sprite0_hit ? 0x40 : 0) |
+                                                  (sprite_overflow ? 0x20 : 0));
+                vblank = false;
+                w = false;
+                return st;
+            }
+            case 4:  // OAMDATA
+                return oam[oamaddr];
+            case 7: {  // PPUDATA (buffered except for palette)
+                uint16_t a2 = v & 0x3FFF;
+                uint8_t ret;
+                if (a2 >= 0x3F00) {
+                    ret = ppu_mem_read(a2);
+                    read_buf = ppu_mem_read(static_cast<uint16_t>(a2 - 0x1000));
+                } else {
+                    ret = read_buf;
+                    read_buf = ppu_mem_read(a2);
+                }
+                ppu_data_bump(rendering_line_now());
+                return ret;
+            }
+            default:
+                return 0;  // write-only registers read as open bus (0 here)
+        }
+    }
+    if (addr < 0x6000) {
+        if (addr == 0x4015) return apu.read_status();
+        if (addr == 0x4016) {
+            uint8_t r;
+            if (joy_strobe) {
+                r = joy[0] & 1;
+            } else {
+                r = joy_shift[0] & 1;
+                joy_shift[0] = static_cast<uint8_t>((joy_shift[0] >> 1) | 0x80);
+            }
+            return static_cast<uint8_t>(r | 0x40);
+        }
+        if (addr == 0x4017) return 0x40;
+        return 0;
+    }
+    return sram[addr & 0x1FFF];  // $6000-$7FFF work RAM
+}
+
+void Machine::wr_io(uint16_t addr, uint8_t val) {
+    if (addr < 0x4000) {
+        switch (addr & 7) {
+            case 0: {  // PPUCTRL
+                bool was_nmi = (ppuctrl & 0x80) != 0;
+                ppuctrl = val;
+                t = static_cast<uint16_t>((t & 0xF3FF) | ((val & 3) << 10));
+                if ((val & 0x80) && !was_nmi && vblank) nmi_pending = true;
+                break;
+            }
+            case 1:  // PPUMASK
+                ppumask = val;
+                break;
+            case 3:  // OAMADDR
+                oamaddr = val;
+                break;
+            case 4:  // OAMDATA
+                oam[oamaddr++] = val;
+                break;
+            case 5:  // PPUSCROLL
+                if (!w) {
+                    fine_x = val & 7;
+                    t = static_cast<uint16_t>((t & ~0x1F) | (val >> 3));
+                    w = true;
+                } else {
+                    t = static_cast<uint16_t>((t & ~0x73E0) | ((val & 7) << 12) | ((val & 0xF8) << 2));
+                    w = false;
+                }
+                break;
+            case 6:  // PPUADDR
+                if (!w) {
+                    t = static_cast<uint16_t>((t & 0x00FF) | ((val & 0x3F) << 8));
+                    w = true;
+                } else {
+                    t = static_cast<uint16_t>((t & 0x7F00) | val);
+                    // While rendering, v takes t a few dots later, as on the hardware. Otherwise
+                    // (vblank, rendering off) the CPU's next $2007 access must already see the new v.
+                    if (rendering_enabled() && rendering_line_now()) {
+                        pending_v_update = 3;
+                    } else {
+                        v = t;
+                    }
+                    w = false;
+                }
+                break;
+            case 7:  // PPUDATA
+                ppu_mem_write(v & 0x3FFF, val);
+                ppu_data_bump(rendering_line_now());
+                break;
+            default:
+                break;
+        }
+        return;
+    }
+    if (addr == 0x4014) {  // OAM DMA: 256 bytes from CPU page, 513/514 cycles
+        uint16_t page = static_cast<uint16_t>(val << 8);
+        for (int i = 0; i < 256; i++) oam[(oamaddr + i) & 0xFF] = rd(static_cast<uint16_t>(page + i));
+        cyc += 513 + (cyc & 1);
+        return;
+    }
+    if (addr == 0x4016) {  // controller strobe
+        joy_strobe = (val & 1) != 0;
+        if (joy_strobe) joy_shift[0] = joy[0];
+        return;
+    }
+    if (addr <= 0x4017) {  // APU registers ($4000-$4013, $4015, $4017)
+        apu.write(addr, val, cyc);
+        return;
+    }
+    if (addr >= 0x6000 && addr < 0x8000) sram[addr & 0x1FFF] = val;
+}
+
+// ---------------------------------------------------------------- MMC3
+
+void Machine::wr_mapper(uint16_t addr, uint8_t val) {
+    bool even = (addr & 1) == 0;
+    switch (addr & 0xE000) {
+        case 0x8000:
+            if (even) {
+                mmc3_sel = val & 7;
+                prg_mode = (val >> 6) & 1;
+                chr_inv = (val >> 7) & 1;
+            } else {
+                mmc3_r[mmc3_sel] = val;
+            }
+            update_mmc3_banks();
+            break;
+        case 0xA000:
+            if (even) mirror = (val & 1) ? Mirror::Horizontal : Mirror::Vertical;
+            // odd: PRG-RAM protect; SMB3 relies on always-enabled SRAM
+            break;
+        case 0xC000:
+            if (even) {
+                irq_latch = val;
+            } else {
+                irq_counter = 0;
+                irq_reload = true;
+            }
+            break;
+        case 0xE000:
+            if (even) {
+                irq_enable = false;
+                irq_line = false;  // acknowledge
+            } else {
+                irq_enable = true;
+            }
+            break;
+        default:
+            break;
+    }
+}
+
+void Machine::update_mmc3_banks() {
+    const uint8_t prg_count = 32;  // 8 KB banks in the 256 KB PRG ROM
+    uint8_t r6 = static_cast<uint8_t>(mmc3_r[6] & 0x3F);
+    uint8_t r7 = static_cast<uint8_t>(mmc3_r[7] & 0x3F);
+    if (prg_mode == 0) {
+        prg_slot[0] = static_cast<uint8_t>(r6 % prg_count);
+        prg_slot[2] = static_cast<uint8_t>(prg_count - 2);
+    } else {
+        prg_slot[0] = static_cast<uint8_t>(prg_count - 2);
+        prg_slot[2] = static_cast<uint8_t>(r6 % prg_count);
+    }
+    prg_slot[1] = static_cast<uint8_t>(r7 % prg_count);
+    prg_slot[3] = static_cast<uint8_t>(prg_count - 1);
+
+    // CHR: two 2 KB banks (R0, R1) and four 1 KB banks (R2-R5); CHR A12 inversion swaps halves.
+    uint8_t r0 = static_cast<uint8_t>(mmc3_r[0] & 0xFE);
+    uint8_t r1 = static_cast<uint8_t>(mmc3_r[1] & 0xFE);
+    uint8_t* c = chr_slot;
+    if (chr_inv == 0) {
+        c[0] = r0; c[1] = static_cast<uint8_t>(r0 + 1);
+        c[2] = r1; c[3] = static_cast<uint8_t>(r1 + 1);
+        c[4] = mmc3_r[2]; c[5] = mmc3_r[3]; c[6] = mmc3_r[4]; c[7] = mmc3_r[5];
+    } else {
+        c[4] = r0; c[5] = static_cast<uint8_t>(r0 + 1);
+        c[6] = r1; c[7] = static_cast<uint8_t>(r1 + 1);
+        c[0] = mmc3_r[2]; c[1] = mmc3_r[3]; c[2] = mmc3_r[4]; c[3] = mmc3_r[5];
+    }
+    // The 128 KB CHR-ROM has 128 1 KB banks; the chip ignores the high bank bits.
+    for (int i = 0; i < 8; i++) c[i] &= 0x7F;
+}
+
+void Machine::mmc3_clock() {
+    if (irq_counter == 0 || irq_reload) {
+        irq_counter = irq_latch;
+        irq_reload = false;
+    } else {
+        irq_counter--;
+    }
+    if (irq_counter == 0 && irq_enable) irq_line = true;
+}
+
+// ---------------------------------------------------------------- PPU memory
+
+size_t Machine::nt_index(uint16_t addr) const {
+    uint16_t nt = (addr >> 10) & 3;
+    size_t phys = (mirror == Mirror::Vertical) ? (nt & 1) : (nt >> 1);
+    return phys * 0x400 + (addr & 0x3FF);
+}
+
+uint8_t Machine::ppu_mem_read(uint16_t addr) {
+    addr &= 0x3FFF;
+    if (addr < 0x2000) return chr_read(addr);
+    if (addr < 0x3F00) return vram[nt_index(addr)];
+    return palram[pal_index(addr)];
+}
+
+void Machine::ppu_mem_write(uint16_t addr, uint8_t val) {
+    addr &= 0x3FFF;
+    if (addr < 0x2000) return;  // CHR is ROM on this board
+    if (addr < 0x3F00) { vram[nt_index(addr)] = val; return; }
+    palram[pal_index(addr)] = val;
+}
+
+// ---------------------------------------------------------------- dispatch
+
+uint16_t Machine::dispatch(uint16_t addr) {
+    if (addr < 0x8000) {
+        std::fprintf(stderr, "dispatch to non-ROM address $%04X\n", addr);
+        std::exit(2);
+    }
+    uint8_t bank = prg_slot[(addr >> 13) & 3];
+    BankFn fn = g_bank_fns[bank];
+    if (!fn) {
+        std::fprintf(stderr, "no code in PRG bank %d (entry $%04X)\n", bank, addr);
+        std::exit(2);
+    }
+    return fn(*this, addr);
+}
+
+uint16_t Machine::badEntry(uint16_t entry, int bank) {
+    std::fprintf(stderr, "bank %d has no code at $%04X (window mapping is wrong)\n", bank, entry);
+    std::exit(2);
+}
+
+void Machine::interrupt(uint16_t vector) {
+    push16(pc);
+    push(static_cast<uint8_t>((p | 0x20) & ~0x10));
+    p |= 0x04;
+    pc = rd16(vector);
+    cyc += 7;
+}
+
+// ---------------------------------------------------------------- frame timing
+
+void Machine::process_events() {
+    // Fire the pending MMC3 clock before the next line starts. If the CPU ran past
+    // both points in one dispatch, line_start would otherwise overwrite that clock.
+    if (irq_armed && cyc >= irq_clock_t) {
+        irq_armed = false;
+        mmc3_clock();
+    }
+    if (cyc >= next_line_t) line_start();
+    evt = irq_armed && irq_clock_t < next_line_t ? irq_clock_t : next_line_t;
+}
+
+bool Machine::rendering_line_now() const {
+    const int cur = static_cast<int>((line_g + kLinesPerFrame - 1) % kLinesPerFrame);
+    return cur < kVisibleLines || cur == kPrerenderLine;
+}
+
+void Machine::line_start() {
+    int line = static_cast<int>(line_g % kLinesPerFrame);
+    // Runs the PPU's 341 dots for this line: pixels, scroll (v/t) and sprites.
+    render_line(line);
+    // The MMC3 counter is clocked on every rendered line, including the pre-render line.
+    if ((line < kVisibleLines || line == kPrerenderLine) && rendering_enabled()) {
+        irq_armed = true;
+        irq_clock_t = next_line_t + kMmc3ClockOffset;
+    }
+    if (line == kVblankLine) {
+        vblank = true;
+        if (ppuctrl & 0x80) nmi_pending = true;
+        frame_done = true;
+    }
+    if (line == kPrerenderLine) {
+        vblank = false;
+        sprite0_hit = false;
+        sprite_overflow = false;
+    }
+    line_g++;
+    next_line_t = (line_g * 341) / 3;
+}
+
+void Machine::run_frame() {
+    frame_done = false;
+    while (!frame_done) {
+        if (nmi_pending) {
+            nmi_pending = false;
+            interrupt(0xFFFA);
+        } else if (irq_line && !(p & 0x04)) {
+            interrupt(0xFFFE);
+        }
+        pc = dispatch(pc);
+        while (cyc >= evt) process_events();
+    }
+}
