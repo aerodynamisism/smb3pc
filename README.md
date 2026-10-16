@@ -148,5 +148,8 @@ frame, exactly as in the desktop app.
 - The SMB3 disassembly, which this port is built from:
   [captainsouthbird/smb3](https://github.com/captainsouthbird/smb3). It
   reassembles to the US PRG1 ROM with NESASM.
+- The APU core, Shay Green's Nes_Snd_Emu (used here in linear-mixing
+  configuration through a single `Blip_Buffer`; LGPL 2.1, see
+  `src/runtime/nes_apu/LGPL.txt`).
 - Nintendo created Super Mario Bros. 3. This project is not affiliated with
   or endorsed by Nintendo.
