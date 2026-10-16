@@ -104,7 +104,6 @@ struct Nes_Dmc : Nes_Osc
 {
 	int address;    // address of next byte to read
 	int period;
-	//int length_counter; // bytes remaining to play (already defined in Nes_Osc)
 	int buf;
 	int bits_remain;
 	int bits;

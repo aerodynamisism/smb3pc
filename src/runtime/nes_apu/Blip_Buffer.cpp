@@ -247,11 +247,6 @@ void Blip_Impulse_::treble_eq( const blip_eq_t& new_eq )
 	{
 		double angle = (i * 2 + 1) * to_angle;
 		
-		// equivalent
-		//double y =     dsf( angle, n_harm * cutoff, 1.0 );
-		//y -= rescale * dsf( angle, n_harm * cutoff, rolloff );
-		//y += rescale * dsf( angle, n_harm,          rolloff );
-		
 		const double cos_angle = cos( angle );
 		const double cos_nc_angle = cos( n_harm * cutoff * angle );
 		const double cos_nc1_angle = cos( (n_harm * cutoff - 1.0) * angle );

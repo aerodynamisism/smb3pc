@@ -31,7 +31,6 @@ public:
 	// If there is insufficient memory for the buffer, sets the buffer length
 	// to 0 and returns error string (or propagates exception if compiler supports it).
 	blargg_err_t sample_rate( long samples_per_sec, int msec_length = blip_default_length );
-	// to do: rename to set_sample_rate
 	
 	// Length of buffer, in milliseconds
 	int length() const;
@@ -49,10 +48,6 @@ public:
 	// Remove all available samples and clear buffer to silence. If 'entire_buffer' is
 	// false, just clear out any samples waiting rather than the entire buffer.
 	void clear( bool entire_buffer = true );
-	
-	// to do:
-	// Notify Blip_Buffer that synthesis has been performed until specified time
-	//void run_until( blip_time_t );
 	
 	// End current time frame of specified duration and make its samples available
 	// (along with any still-unread samples) for reading with read_samples(). Begin

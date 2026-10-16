@@ -18,7 +18,6 @@ Usage:
   translate.py --src tools/translate/smb3-src/smb3.asm --rom ROM.nes --out build/gen
 """
 import argparse
-import hashlib
 import os
 import re
 import sys
@@ -325,7 +324,7 @@ def load_lines(src_path):
 # ---------------------------------------------------------------------------
 class Item:
     __slots__ = ("kind", "file", "line", "text", "bank", "addr", "mn", "operand",
-                 "exprs", "count", "size", "name", "expr", "emit", "fwd")
+                 "exprs", "size", "name", "expr", "emit", "fwd")
 
     def __init__(self, kind, file, line, text, bank=None):
         self.kind = kind
@@ -337,7 +336,6 @@ class Item:
         self.mn = None
         self.operand = None
         self.exprs = None
-        self.count = None
         self.size = None
         self.name = None
         self.expr = None
@@ -487,7 +485,6 @@ def parse_source(src_path):
             elif d == ".byte":
                 it = Item("bytes", file, lineno, body)
                 it.exprs = split_byte_list(arg)
-                it.count = 1
                 items.append(it)
             elif d == ".word":
                 it = Item("words", file, lineno, body)
@@ -564,7 +561,7 @@ def decode_operand(mn, operand):
     m = re.match(r"^(.*?)\s*,\s*([XxYy])\s*$", op)
     if m:
         idx = m.group(2).upper()
-        return ("zp" + idx.lower() if False else ("zp" + idx.lower()), m.group(1).strip(), force_zp)
+        return ("zp" + idx.lower(), m.group(1).strip(), force_zp)
     return ("abs", op.strip(), force_zp)
 
 
@@ -622,7 +619,7 @@ def byte_size_of(it):
     return None
 
 
-def layout(items, syms, final):
+def layout(items, syms):
     """Assign addresses to all items. Returns (ok, unknowns)."""
     global _NOZP
     bank = None
@@ -676,22 +673,19 @@ def layout(items, syms, final):
             finally:
                 _NOZP = False
         pc = (pc + it.size) & 0xFFFF if it.size is not None else pc
-        if it.size is not None and it.kind in ("instr", "bytes", "words", "ds", "vaddr", "dmcalign"):
-            pc = pc
     return unknown
 
 
 def instr_size(it, syms, unknown):
     mn = it.mn
     if mn in MACRO_BRANCH:
-        mn2 = MACRO_BRANCH[mn]
         return 2
     if mn in MACRO_ALU:
         # ADD/SUB expand to CLC/SEC + ADC/SBC with operand
         mode, expr, force = decode_operand("ADC", it.operand)
         return 1 + instr_size_mode("ADC" if mn == "ADD" else "SBC", it.operand, syms, unknown)
     if mn == "NEG":
-        return 2 + 2 + 1 - 1 + 1 + 1 - 1  # EOR #$FF (2) + CLC (1) + ADC #$01 (2)
+        return 5  # EOR #$FF (2) + CLC (1) + ADC #$01 (2)
     return instr_size_mode(mn, it.operand, syms, unknown)
 
 
@@ -732,7 +726,7 @@ def _encode_instr(it, syms, pc):
     mn = it.mn
     if mn in MACRO_BRANCH:
         real = MACRO_BRANCH[mn]
-        out = encode_instr_like(real, "rel", it.operand, syms, pc)
+        out = encode_instr_mode(real, it.operand, syms, pc)
         return out
     if mn in MACRO_ALU:
         real = "ADC" if mn == "ADD" else "SBC"
@@ -742,11 +736,6 @@ def _encode_instr(it, syms, pc):
     if mn == "NEG":
         return bytes([0x49, 0xFF, 0x18, 0x69, 0x01]), "neg", None
     body, mode, tgt = encode_instr_mode(mn, it.operand, syms, pc)
-    return body, mode, tgt
-
-
-def encode_instr_like(real, mode_hint, operand, syms, pc):
-    body, mode, tgt = encode_instr_mode(real, operand, syms, pc)
     return body, mode, tgt
 
 
@@ -893,14 +882,11 @@ def is_gate(it):
             and os.path.basename(it.file) == "prg031.asm")
 
 
-FLAG_NZ = "m.nz(%s);"
-
-
 def hexa(v):
     return "0x%04X" % (v & 0xFFFF)
 
 
-def read_expr(mode, mn, val_expr, zp_or_abs, pen):
+def read_expr(mode, val_expr, pen):
     """Return a C++ expression reading the operand value (value-producing)."""
     if mode == "imm":
         return "0x%02X" % (val_expr & 0xFF)
@@ -951,16 +937,14 @@ def base_cycles(mn, mode):
 
 
 class BankEmitter:
-    def __init__(self, bank, origin, labels):
-        self.bank = bank
-        self.origin = origin
+    def __init__(self, labels):
         self.labels = labels  # set of addresses with a label in this bank
         self.lines = []
 
     def out(self, s):
         self.lines.append(s)
 
-    def target(self, addr, src_comment=""):
+    def target(self, addr):
         """Emit a transfer to addr from within the bank function."""
         if addr in self.labels:
             self.out("if (m.cyc >= m.evt) return %s; goto L_%04X;" % (hexa(addr), addr))
@@ -982,25 +966,22 @@ def emit_instr(be, it, data, mode, tgt):
         return
     if mn in MACRO_BRANCH:
         real = MACRO_BRANCH[mn]
-        return emit_branch(be, real, a, data, tgt)
+        return emit_branch(be, real, a, tgt)
     if mn in MACRO_ALU:
         real = "ADC" if mn == "ADD" else "SBC"
         # The CLC/SEC prefix is one byte; emit as a single C++ sequence.
         be.out("m.cyc += 2; m.p &= ~0x01;" if mn == "ADD" else "m.cyc += 2; m.p |= 0x01;")
-        value = data[2:] if False else None
-        emit_alu_real(be, real, it, a + 1, data[1:])
+        emit_alu_real(be, real, it)
         return
     if mn == "NEG":
-        be.out("m.cyc += 6; m.a = (uint8_t)(~m.a); m.nz(m.a); m.p &= ~0x01; "
-               "m.a = m.adc_raw(m.a, 0x01);")
+        be.out("m.cyc += 6; m.a = (uint8_t)(~m.a); m.p &= ~0x01; m.adc(0x01);")
         return
     if mn in ("BCC", "BCS", "BEQ", "BMI", "BNE", "BPL", "BVC", "BVS"):
-        return emit_branch(be, mn, a, data, tgt)
+        return emit_branch(be, mn, a, tgt)
     emit_real(be, mn, mode, it, data, tgt)
 
 
-def emit_alu_real(be, real, it, addr, body):
-    # body: opcode + operand bytes of the ADC/SBC part
+def emit_alu_real(be, real, it):
     mode, expr, force = decode_operand(real, it.operand)
     value = evaluate(expr, SYMS_REF[0]) if expr is not None else None
     fm = resolve_mode(real, mode, value, force, expr)
@@ -1009,10 +990,10 @@ def emit_alu_real(be, real, it, addr, body):
     if fm == "imm":
         be.out("m.%s(0x%02X);" % ("adc" if real == "ADC" else "sbc", value & 0xFF))
     else:
-        be.out("m.%s(%s);" % ("adc" if real == "ADC" else "sbc", read_expr(fm, real, value, None, True)))
+        be.out("m.%s(%s);" % ("adc" if real == "ADC" else "sbc", read_expr(fm, value, True)))
 
 
-def emit_branch(be, mn, a, data, tgt):
+def emit_branch(be, mn, a, tgt):
     cond = {
         "BCC": "!(m.p & 0x01)", "BCS": "(m.p & 0x01)",
         "BEQ": "(m.p & 0x02)", "BNE": "!(m.p & 0x02)",
@@ -1111,7 +1092,7 @@ def emit_real(be, mn, mode, it, data, tgt):
     if mn in ("LDA", "LDX", "LDY"):
         reg = {"LDA": "a", "LDX": "x", "LDY": "y"}[mn]
         pen = mode in ("absx", "absy", "indy")
-        be.out("m.cyc += %d; m.%s = %s; m.nz(m.%s);" % (cy, reg, read_expr(mode, mn, val, None, pen), reg))
+        be.out("m.cyc += %d; m.%s = %s; m.nz(m.%s);" % (cy, reg, read_expr(mode, val, pen), reg))
         return
     if mn in ("STA", "STX", "STY"):
         reg = {"STA": "a", "STX": "x", "STY": "y"}[mn]
@@ -1124,20 +1105,20 @@ def emit_real(be, mn, mode, it, data, tgt):
     if mn in ("AND", "ORA", "EOR"):
         op = {"AND": "&=", "ORA": "|=", "EOR": "^="}[mn]
         pen = mode in ("absx", "absy", "indy")
-        be.out("m.cyc += %d; m.a %s %s; m.nz(m.a);" % (cy, op, read_expr(mode, mn, val, None, pen)))
+        be.out("m.cyc += %d; m.a %s %s; m.nz(m.a);" % (cy, op, read_expr(mode, val, pen)))
         return
     if mn in ("ADC", "SBC"):
         pen = mode in ("absx", "absy", "indy")
         fn = "adc" if mn == "ADC" else "sbc"
-        be.out("m.cyc += %d; m.%s(%s);" % (cy, fn, read_expr(mode, mn, val, None, pen)))
+        be.out("m.cyc += %d; m.%s(%s);" % (cy, fn, read_expr(mode, val, pen)))
         return
     if mn in ("CMP", "CPX", "CPY"):
         reg = {"CMP": "a", "CPX": "x", "CPY": "y"}[mn]
         pen = mode in ("absx", "absy", "indy")
-        be.out("m.cyc += %d; m.cmp(m.%s, %s);" % (cy, reg, read_expr(mode, mn, val, None, pen)))
+        be.out("m.cyc += %d; m.cmp(m.%s, %s);" % (cy, reg, read_expr(mode, val, pen)))
         return
     if mn == "BIT":
-        be.out("m.cyc += %d; m.bit(%s);" % (cy, read_expr(mode, mn, val, None, False)))
+        be.out("m.cyc += %d; m.bit(%s);" % (cy, read_expr(mode, val, False)))
         return
     if mn in ("ASL", "LSR", "ROL", "ROR", "INC", "DEC"):
         if mode == "acc":
@@ -1167,7 +1148,7 @@ def emit_bank(bank, origin, items):
     for it in items:
         if it.kind == "instr":
             labels.add(it.addr)
-    be = BankEmitter(bank, origin, labels)
+    be = BankEmitter(labels)
     cases = sorted(labels)
     lines = []
     lines.append("// Generated by tools/translate/translate.py -- do not edit.")
@@ -1184,10 +1165,9 @@ def emit_bank(bank, origin, items):
         if it.kind == "instr":
             data, mode, tgt = it.emit
             # Fresh emitter buffer per instruction, then splice
-            sub = BankEmitter(bank, origin, labels)
+            sub = BankEmitter(labels)
             emit_instr(sub, it, data, mode, tgt)
             lines.extend("  " + l if not l.startswith("L_") else l for l in sub.lines)
-    last = max((it.addr + it.size for it in items if it.kind in ("instr", "bytes", "words", "ds", "vaddr", "dmcalign") and it.size is not None), default=origin)
     lines.append("  return %s;  // fall out of the bank window" % hexa(origin + 0x2000))
     lines.append("}")
     lines.append("")
@@ -1214,10 +1194,10 @@ def main():
     # Iterate layout until symbols settle (forward references).
     for _ in range(8):
         before = dict(syms)
-        unknown = layout(items, syms, final=False)
+        unknown = layout(items, syms)
         if syms == before and not unknown:
             break
-    unknown = layout(items, syms, final=True)
+    unknown = layout(items, syms)
     if unknown:
         sys.exit("unresolved symbols: %s" % sorted(unknown)[:20])
     SYMS_REF[0] = syms
@@ -1249,20 +1229,14 @@ def main():
     banks = {}
     origins = {}
     for it in items:
-        if it.kind == "bank":
-            cur = it.expr
         if it.kind == "org" and it.bank is not None:
             origins.setdefault(it.bank, it.addr)
-    cur_bank = None
     for it in items:
-        if it.kind == "bank":
-            cur_bank = it.bank
         if it.kind == "instr" and it.bank is not None:
             banks.setdefault(it.bank, []).append(it)
     table = []
     total = 0
     for bank in sorted(banks):
-        insts = banks[bank]
         origin = origins[bank]
         # Emit only the bank's own items (instructions + their labels are the same set)
         bank_items = [it for it in items if it.bank == bank and it.kind in ("instr",)]
@@ -1270,7 +1244,7 @@ def main():
         for it in bank_items:
             if not (origin <= it.addr < origin + 0x2000):
                 sys.exit("instruction %s:%d at $%04X outside bank %d window" % (it.file, it.line, it.addr, bank))
-        text, labels = emit_bank(bank, origin, bank_items)
+        text, _labels = emit_bank(bank, origin, bank_items)
         path = os.path.join(args.out, "bank_%02d.cpp" % bank)
         with open(path, "w") as fh:
             fh.write(text)

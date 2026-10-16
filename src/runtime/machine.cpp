@@ -1,11 +1,8 @@
 #include "runtime/machine.h"
 
 #include <algorithm>
-#include <climits>
 #include <cstdio>
 #include <cstdlib>
-
-#include "runtime/nes_palette.h"
 
 // Generated table: g_bank_fns[bank] = bank_NN (or nullptr for data-only banks).
 #include "bank_table.inc"

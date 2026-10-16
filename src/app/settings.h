@@ -83,7 +83,7 @@ inline bool load(const std::string& path, AppSettings& s) {
 
 inline bool save(const std::string& path, const AppSettings& s) {
     // Line-preserving update: the file also holds controller bindings, so
-    // only the three known keys are rewritten in place and everything else
+    // only the two known keys are rewritten in place and everything else
     // (bindings, comments, blank lines) is kept as-is.
     const char* names[2] = {"video.fullscreen", "video.show_fps"};
     std::string values[2] = {

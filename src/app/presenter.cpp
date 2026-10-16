@@ -4,7 +4,6 @@
 #include <SDL3/SDL_vulkan.h>
 
 #include <algorithm>
-#include <cmath>
 #include <cstdio>
 #include <cstring>
 #include <fstream>
