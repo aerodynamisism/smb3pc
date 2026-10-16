@@ -14,6 +14,8 @@ import os
 import sys
 
 EXPECTED_SHA1 = "6bd518e85eb46a4252af07910f61036e84b020d1"
+EXPECTED_PRG_SHA1 = "46a9acfc0b2f7c891a90a104d0ea803f96330ced"
+EXPECTED_CHR_SHA1 = "2697d1f21b72a6d8e7d2a2d2c51c9c5550f68b56"
 PRG_SIZE = 16 * 16 * 1024   # 256 KB
 CHR_SIZE = 16 * 8 * 1024    # 128 KB
 
@@ -27,8 +29,6 @@ def main():
     with open(args.rom, "rb") as fh:
         rom = fh.read()
     sha1 = hashlib.sha1(rom).hexdigest()
-    if sha1 != EXPECTED_SHA1:
-        sys.exit("ROM is not the verified SMB3 (U) PRG1 dump (sha1 %s)" % sha1)
     if rom[:4] != b"NES\x1a" or rom[4] != 16 or rom[5] != 16 or (rom[6] >> 4) != 4:
         sys.exit("unexpected iNES header")
     if len(rom) != 16 + PRG_SIZE + CHR_SIZE:
@@ -36,6 +36,17 @@ def main():
 
     prg = rom[16:16 + PRG_SIZE]
     chr_data = rom[16 + PRG_SIZE:]
+
+    # The game data is what matters: header variants of the same dump
+    # (e.g. No-Intro "(USA) (Rev 1)" vs GoodNES "(U) (PRG1) [!]") carry
+    # identical PRG/CHR, so the payload hash is the real check.
+    if hashlib.sha1(prg).hexdigest() != EXPECTED_PRG_SHA1 or \
+            hashlib.sha1(chr_data).hexdigest() != EXPECTED_CHR_SHA1:
+        sys.exit("ROM payload is not the verified SMB3 (U) PRG1 dump "
+                 "(prg %.8s.., chr %.8s..)"
+                 % (hashlib.sha1(prg).hexdigest(), hashlib.sha1(chr_data).hexdigest()))
+    if sha1 != EXPECTED_SHA1:
+        print("note: non-canonical header (sha1 %s); payload verified" % sha1)
 
     os.makedirs(args.out, exist_ok=True)
     with open(os.path.join(args.out, "prg.bin"), "wb") as fh:
