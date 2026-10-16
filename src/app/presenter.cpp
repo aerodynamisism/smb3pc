@@ -490,11 +490,12 @@ bool Presenter::present(const uint32_t* rgba) {
     vkCmdPipelineBarrier(cmd_, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, 0,
                          0, nullptr, 0, nullptr, 1, &to_sample);
 
-    // Zoom to fill: the largest scale that covers the window keeps square pixels. The part of the
-    // picture that overflows is centred and clipped by the scissor, so no black border remains.
+    // Fit inside the window: the largest scale that fits keeps square pixels.
+    // The viewport is centred, so the clear colour pillarboxes/letterboxes
+    // the unused area instead of cropping the picture.
     const float sw = static_cast<float>(swap_extent_.width);
     const float sh = static_cast<float>(swap_extent_.height);
-    const float scale = std::max(sw / kVisibleW, sh / kFrameH);
+    const float scale = std::min(sw / kVisibleW, sh / kFrameH);
     const float vw = kVisibleW * scale;
     const float vh = kFrameH * scale;
     VkViewport viewport{(sw - vw) * 0.5f, (sh - vh) * 0.5f, vw, vh, 0.0f, 1.0f};

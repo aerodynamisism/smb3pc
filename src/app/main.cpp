@@ -140,7 +140,9 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "SDL_Init: %s\n", SDL_GetError());
         return 1;
     }
-    SDL_Window* window = SDL_CreateWindow("Super Mario Bros. 3", 768, 720,
+    // 720x720 is exactly 3x the visible 240x240 picture (overscan cropped), so the
+    // pillarboxed viewport fills the window with no black border at startup.
+    SDL_Window* window = SDL_CreateWindow("Super Mario Bros. 3", 720, 720,
                                           SDL_WINDOW_VULKAN | SDL_WINDOW_RESIZABLE);
     if (!window) {
         std::fprintf(stderr, "SDL_CreateWindow: %s\n", SDL_GetError());
@@ -181,8 +183,11 @@ int main(int argc, char** argv) {
         bool running = true;
         uint64_t deadline = SDL_GetTicksNS();
         std::vector<int16_t> samples;
-        // F11 opens the menu. The game is paused while it is open.
+        // F11 (keyboard) or L3+R3 (gamepad sticks) opens the menu. The game is paused while it is open.
         bool menu_open = false;
+        bool l3_down = false;     // gamepad menu-chord state (L3+R3 toggles the menu)
+        bool r3_down = false;
+        bool chord_fired = false;
         int menu_sel = 0;
         bool show_fps = false;
         int fps_shown = 0;
@@ -254,6 +259,15 @@ int main(int argc, char** argv) {
                     case SDL_EVENT_GAMEPAD_BUTTON_DOWN:
                     case SDL_EVENT_GAMEPAD_BUTTON_UP: {
                         const bool down = ev.type == SDL_EVENT_GAMEPAD_BUTTON_DOWN;
+                        if (ev.gbutton.button == SDL_GAMEPAD_BUTTON_LEFT_STICK) l3_down = down;
+                        if (ev.gbutton.button == SDL_GAMEPAD_BUTTON_RIGHT_STICK) r3_down = down;
+                        if (!down) {
+                            chord_fired = false;  // re-arm once either stick is released
+                        } else if (l3_down && r3_down && !chord_fired) {
+                            chord_fired = true;
+                            menu_open = !menu_open;
+                            if (menu_open) menu_sel = 0;
+                        }
                         if (menu_open && down) {
                             switch (ev.gbutton.button) {
                                 case SDL_GAMEPAD_BUTTON_DPAD_UP:
@@ -288,6 +302,7 @@ int main(int argc, char** argv) {
                             SDL_CloseGamepad(pad);
                             pad = nullptr;
                             gp_state = 0;
+                            l3_down = r3_down = chord_fired = false;
                         }
                         break;
                     default:

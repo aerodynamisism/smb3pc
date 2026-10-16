@@ -2,7 +2,7 @@
 // with scripted input, and writes the final frame as PNG. Used for verification
 // without a window.
 //
-//   smb3_headless --assets assets --frames 600 --out frame.png [--press start@300]
+//   smb3_headless --assets assets --frames 600 --out frame.png [--press-start N]
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -112,11 +112,47 @@ bool write_png(const char* path, const uint32_t* rgba, int w, int h) {
     return true;
 }
 
+void write_u16le(std::FILE* f, uint16_t x) {
+    std::fputc(x & 0xFF, f);
+    std::fputc(x >> 8, f);
+}
+
+void write_u32le(std::FILE* f, uint32_t x) {
+    std::fputc(x & 0xFF, f);
+    std::fputc((x >> 8) & 0xFF, f);
+    std::fputc((x >> 16) & 0xFF, f);
+    std::fputc(x >> 24, f);
+}
+
+// Mono int16 WAV at the APU output rate, for listening checks.
+bool write_wav(const char* path, const std::vector<int16_t>& samples) {
+    std::FILE* f = std::fopen(path, "wb");
+    if (!f) return false;
+    const uint32_t rate = 48000;
+    const uint32_t bytes = static_cast<uint32_t>(samples.size() * sizeof(int16_t));
+    std::fwrite("RIFF", 1, 4, f);
+    write_u32le(f, 36 + bytes);
+    std::fwrite("WAVEfmt ", 1, 8, f);
+    write_u32le(f, 16);
+    write_u16le(f, 1);      // PCM
+    write_u16le(f, 1);      // mono
+    write_u32le(f, rate);
+    write_u32le(f, rate * sizeof(int16_t));
+    write_u16le(f, sizeof(int16_t));
+    write_u16le(f, 16);
+    std::fwrite("data", 1, 4, f);
+    write_u32le(f, bytes);
+    std::fwrite(samples.data(), sizeof(int16_t), samples.size(), f);
+    std::fclose(f);
+    return true;
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
     std::string assets = "assets";
     std::string out = "frame.png";
+    std::string wav_out;
     int frames = 300;
     int press_start_at = -1;
     int press_start_len = 6;
@@ -126,6 +162,7 @@ int main(int argc, char** argv) {
         else if (arg == "--out" && i + 1 < argc) out = argv[++i];
         else if (arg == "--frames" && i + 1 < argc) frames = std::atoi(argv[++i]);
         else if (arg == "--press-start" && i + 1 < argc) press_start_at = std::atoi(argv[++i]);
+        else if (arg == "--wav" && i + 1 < argc) wav_out = argv[++i];
     }
 
     std::vector<uint8_t> prg = read_file(assets + "/prg.bin");
@@ -140,10 +177,24 @@ int main(int argc, char** argv) {
     m->chr = chr.data();
     m->reset();
 
+    // The APU applies its register writes and advances only inside render(), so call it every
+    // frame as the desktop app does. Samples are kept only when --wav asks for them.
+    std::vector<int16_t> samples;
+    std::vector<int16_t> all_samples;
+    if (!wav_out.empty()) all_samples.reserve(static_cast<size_t>(frames) * 900);
     for (int f = 0; f < frames; f++) {
         m->joy[0] = 0;
-        if (press_start_at >= 0 && f >= press_start_at && f < press_start_at + press_start_len) m->joy[0] = 0x08;
+        if (press_start_at >= 0 && f >= press_start_at && f < press_start_at + press_start_len) {
+            m->joy[0] = 0x08;
+        }
         m->run_frame();
+        samples.clear();
+        m->apu.render(m->cyc, samples);
+        if (!wav_out.empty()) all_samples.insert(all_samples.end(), samples.begin(), samples.end());
+    }
+    if (!wav_out.empty() && !write_wav(wav_out.c_str(), all_samples)) {
+        std::fprintf(stderr, "cannot write %s\n", wav_out.c_str());
+        return 1;
     }
     if (!write_png(out.c_str(), m->framebuf, 256, 240)) {
         std::fprintf(stderr, "cannot write %s\n", out.c_str());

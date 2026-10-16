@@ -1,6 +1,6 @@
 // Vulkan presenter: uploads each 256x240 RGBA frame to a texture and draws it
-// to the swapchain with a nearest-filtered fullscreen triangle, zoomed to
-// keep square pixels and fill the window (overflow is trimmed).
+// to the swapchain with a nearest-filtered fullscreen triangle, fitted to
+// keep square pixels and pillarboxed/letterboxed (no cropping).
 #pragma once
 
 #include <cstdint>

@@ -72,15 +72,38 @@ struct Machine {
     uint8_t sprite_y = 0, sprite_index = 0;
     bool sprite_in_range = false;
     uint16_t ppu_addr_bus = 0;
+    int64_t a12_low_dot = -1;            // dot at which PPU address line A12 last went low (-1: high)
 
     // ---- timing (NTSC: 262 lines of 341 PPU dots; CPU = PPU / 3) ----
-    int64_t line_g = 0;         // global scanline counter
-    int64_t next_line_t = 0;    // cycle at which line_g starts
-    bool irq_armed = false;     // MMC3 clock pending for the current line
-    int64_t irq_clock_t = 0;
+    int64_t ppu_dot_pos = 0;    // PPU dots run so far (the PPU is synced to cyc * 3 before each register access)
+    int ppu_line = 0;           // scanline of the next dot to run (0-261)
+    int ppu_dot = 0;            // dot of the next dot to run (0-340)
 
     // ---- output ----
     uint32_t framebuf[256 * 240] = {};  // RGBA8: R in the low byte
+
+    // ---- status-bar layer ----
+    // The rows from the split IRQ down are composed at the end of the frame from the scroll,
+    // palette and bank state captured on the first status-bar line, so the status bar does not
+    // depend on where the CPU was when each line was drawn.
+    static constexpr int kNoHud = 240;
+    int hud_top = kNoHud;               // first status-bar row of this frame (last split IRQ wins)
+    bool hud_layer_enabled = true;      // false draws every row from the per-dot pipeline
+    // State each visible line is drawn from, captured at its dot 1. The game's split writes land
+    // over several status-bar lines, so one snapshot per frame would not match the per-dot output.
+    struct HudLine {
+        uint16_t v = 0;
+        uint8_t fine_x = 0, ctrl = 0, mask = 0;
+        bool on = false;                // rendering was enabled
+        uint8_t palram[32] = {};
+        uint8_t chr_slot[8] = {};
+        uint8_t oam[256] = {};          // sprite RAM: sprites are absolute-positioned, but the
+                                        // per-dot pass mixes them with the (then wrong) playfield
+                                        // background, so the compositor re-evaluates them here
+    };
+    HudLine hud_lines[240] = {};
+    void hud_capture(int line);
+    void hud_compose();
 
     // ---- input ----
     uint8_t joy[2] = {0, 0};        // A B Select Start Up Down Left Right (bit 0 = A)
@@ -198,16 +221,21 @@ struct Machine {
     // ---- interrupts / errors ----
     void interrupt(uint16_t vector);
     uint16_t vectorIrq() { return rd16(0xFFFE); }
+    // After CLI or PLP the I flag changes; an IRQ that is now enabled is taken after the next
+    // instruction, so wake the dispatcher at once.
+    void kick_irq() { if (irq_line && !(p & 0x04)) evt = cyc + 1; }
     void brk() { push16(static_cast<uint16_t>(pc + 2)); push(static_cast<uint8_t>(p | 0x30)); p |= 0x04; }
     [[noreturn]] uint16_t badEntry(uint16_t entry, int bank);
 
     // ---- internals used by the frame loop ----
     uint16_t dispatch(uint16_t addr);
     void process_events();
-    void line_start();
+    void ppu_sync();                        // runs the PPU dots up to the CPU's current cycle
+    void ppu_step();                        // runs one PPU dot and the line/frame events on it
     void mmc3_clock();
+    void ppu_set_addr(uint16_t addr);       // drives the PPU address bus and watches A12 for MMC3
     void update_mmc3_banks();
-    void render_line(int line);             // runs the 341 dots of one scanline
+    void render_dot(int line, int dot);     // renders one PPU dot (pixels, v/t, sprites)
     void ppu_data_bump(bool rendering_line);  // $2007 access side effect on v
     bool rendering_line_now() const;          // the scanline the CPU is currently in is rendered
     bool rendering_enabled() const { return (ppumask & 0x18) != 0; }

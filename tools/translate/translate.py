@@ -15,7 +15,7 @@ to the runtime dispatcher, which maps it to the bank currently mapped there.
 The 6502 stack lives in RAM, so RTS-based dispatch tables work unchanged.
 
 Usage:
-  translate.py --src third_party/smb3/smb3.asm --rom ROM.nes --out build/gen
+  translate.py --src tools/translate/smb3-src/smb3.asm --rom ROM.nes --out build/gen
 """
 import argparse
 import hashlib
@@ -927,6 +927,9 @@ def emit_instr(be, it, data, mode, tgt):
     cyc_label = "L_%04X" % a
     comment = "// %s:%d  %s" % (it.file, it.line, it.text.replace("*/", "* /"))
     be.out("%s:  %s" % (cyc_label, comment))
+    # Return to the dispatcher before any instruction once an event (line start, MMC3 clock,
+    # pending IRQ) is due, so interrupts are taken on the cycle they occur, not at the next label.
+    be.out("if (m.cyc >= m.evt) return %s;" % hexa(a))
     if mn in MACRO_BRANCH:
         real = MACRO_BRANCH[mn]
         return emit_branch(be, real, a, data, tgt)
@@ -1034,7 +1037,7 @@ def emit_real(be, mn, mode, it, data, tgt):
     if mn in ("SEC",):
         be.out("m.cyc += %d; m.p |= 0x01;" % cy); return
     if mn in ("CLI",):
-        be.out("m.cyc += %d; m.p &= ~0x04;" % cy); return
+        be.out("m.cyc += %d; m.p &= ~0x04; m.kick_irq();" % cy); return
     if mn in ("SEI",):
         be.out("m.cyc += %d; m.p |= 0x04;" % cy); return
     if mn in ("CLD",):
@@ -1050,7 +1053,7 @@ def emit_real(be, mn, mode, it, data, tgt):
     if mn == "PLA":
         be.out("m.cyc += %d; m.a = m.pull(); m.nz(m.a);" % cy); return
     if mn == "PLP":
-        be.out("m.cyc += %d; m.p = (uint8_t)((m.pull() & ~0x10) | 0x20);" % cy); return
+        be.out("m.cyc += %d; m.p = (uint8_t)((m.pull() & ~0x10) | 0x20); m.kick_irq();" % cy); return
 
     # Memory-operand instructions
     if mn in ("LDA", "LDX", "LDY"):

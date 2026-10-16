@@ -14,15 +14,15 @@ constexpr int kLinesPerFrame = 262;
 constexpr int kVisibleLines = 240;
 constexpr int kVblankLine = 241;
 constexpr int kPrerenderLine = 261;
-// Approximate CPU cycle (of 113.67 per line) at which the MMC3 sees A12 rise:
-// PPU dot 260 of the line.
-constexpr int64_t kMmc3ClockOffset = 87;
+constexpr int kDotsPerLine = 341;
+constexpr int64_t kA12FilterDots = 9;  // A12 must stay low this long before a rise clocks the MMC3
 }  // namespace
 
 // ---------------------------------------------------------------- lifecycle
 
 void Machine::reset() {
     apu.read_cpu = [this](uint16_t addr) { return rd(addr); };  // DMC sample fetches
+    apu.reset();  // linear Blargg APU to power-on state (keeps read_cpu hook)
     prg_mode = 0;
     chr_inv = 0;
     mmc3_sel = 0;
@@ -32,9 +32,11 @@ void Machine::reset() {
     p = 0x24;
     cyc = 0;
     evt = 0;
-    line_g = 0;
-    next_line_t = 0;
-    irq_armed = false;
+    ppu_dot_pos = 0;
+    ppu_line = 0;
+    ppu_dot = 0;
+    pending_v_update = 0;
+    a12_low_dot = -1;
     irq_line = false;
     nmi_pending = false;
     pc = rd16(0xFFFC);
@@ -44,6 +46,7 @@ void Machine::reset() {
 
 uint8_t Machine::rd_io(uint16_t addr) {
     if (addr < 0x4000) {
+        ppu_sync();
         switch (addr & 7) {
             case 2: {  // PPUSTATUS
                 uint8_t st = static_cast<uint8_t>((vblank ? 0x80 : 0) | (sprite0_hit ? 0x40 : 0) |
@@ -72,7 +75,7 @@ uint8_t Machine::rd_io(uint16_t addr) {
         }
     }
     if (addr < 0x6000) {
-        if (addr == 0x4015) return apu.read_status();
+        if (addr == 0x4015) return apu.read_status(cyc);
         if (addr == 0x4016) {
             uint8_t r;
             if (joy_strobe) {
@@ -91,6 +94,7 @@ uint8_t Machine::rd_io(uint16_t addr) {
 
 void Machine::wr_io(uint16_t addr, uint8_t val) {
     if (addr < 0x4000) {
+        ppu_sync();
         switch (addr & 7) {
             case 0: {  // PPUCTRL
                 bool was_nmi = (ppuctrl & 0x80) != 0;
@@ -239,7 +243,12 @@ void Machine::mmc3_clock() {
     } else {
         irq_counter--;
     }
-    if (irq_counter == 0 && irq_enable) irq_line = true;
+    if (irq_counter == 0 && irq_enable) {
+        irq_line = true;
+        // The status bar is the bottom split of the frame, so the last IRQ wins: its rows start
+        // on the next line. (Single-split games like SMB3 are unaffected.)
+        if (ppu_line < kVisibleLines - 1) hud_top = ppu_line + 1;
+    }
 }
 
 // ---------------------------------------------------------------- PPU memory
@@ -296,42 +305,61 @@ void Machine::interrupt(uint16_t vector) {
 // ---------------------------------------------------------------- frame timing
 
 void Machine::process_events() {
-    // Fire the pending MMC3 clock before the next line starts. If the CPU ran past
-    // both points in one dispatch, line_start would otherwise overwrite that clock.
-    if (irq_armed && cyc >= irq_clock_t) {
-        irq_armed = false;
-        mmc3_clock();
+    // The MMC3 counter is clocked by A12 edges on the PPU's fetches (ppu_set_addr), which can happen
+    // on any dot. So the PPU is run up to the CPU after every instruction. An IRQ raised by a fetch is
+    // then taken after the instruction that is running, as on the 6502.
+    ppu_sync();
+    evt = cyc + 1;
+}
+
+// Drive the PPU address bus. The MMC3 counts rising edges of A12 (bit 12). Hardware only counts a
+// rise after A12 has been low for about 3 CPU cycles (9 PPU dots). The short low gaps between sprite
+// pattern fetches (4 dots) therefore do not clock the counter.
+// Design informed by MesenCE (https://github.com/nesdev-org/MesenCE, GPLv3) NesPpu/MMC3: every
+// pattern/nametable fetch drives the bus through one A12 watcher. Rewritten; no MesenCE code.
+void Machine::ppu_set_addr(uint16_t addr) {
+    ppu_addr_bus = addr;
+    if (addr & 0x1000) {
+        const bool rising = a12_low_dot >= 0 && ppu_dot_pos - a12_low_dot >= kA12FilterDots;
+        a12_low_dot = -1;
+        if (rising) mmc3_clock();
+    } else if (a12_low_dot < 0) {
+        a12_low_dot = ppu_dot_pos;
     }
-    if (cyc >= next_line_t) line_start();
-    evt = irq_armed && irq_clock_t < next_line_t ? irq_clock_t : next_line_t;
 }
 
 bool Machine::rendering_line_now() const {
-    const int cur = static_cast<int>((line_g + kLinesPerFrame - 1) % kLinesPerFrame);
-    return cur < kVisibleLines || cur == kPrerenderLine;
+    return ppu_line < kVisibleLines || ppu_line == kPrerenderLine;
 }
 
-void Machine::line_start() {
-    int line = static_cast<int>(line_g % kLinesPerFrame);
-    // Runs the PPU's 341 dots for this line: pixels, scroll (v/t) and sprites.
-    render_line(line);
-    // The MMC3 counter is clocked on every rendered line, including the pre-render line.
-    if ((line < kVisibleLines || line == kPrerenderLine) && rendering_enabled()) {
-        irq_armed = true;
-        irq_clock_t = next_line_t + kMmc3ClockOffset;
-    }
-    if (line == kVblankLine) {
+void Machine::ppu_sync() {
+    const int64_t target = cyc * 3;
+    while (ppu_dot_pos < target) ppu_step();
+}
+
+void Machine::ppu_step() {
+    const int line = ppu_line;
+    const int dot = ppu_dot;
+    render_dot(line, dot);
+    if (hud_layer_enabled && dot == 1 && line < kVisibleLines) hud_capture(line);
+    if (line == kVblankLine && dot == 1) {
+        // VRAM and the palette still hold this frame's values until the NMI handler runs.
+        if (hud_layer_enabled) hud_compose();
         vblank = true;
         if (ppuctrl & 0x80) nmi_pending = true;
         frame_done = true;
     }
-    if (line == kPrerenderLine) {
+    if (line == kPrerenderLine && dot == 1) {
+        hud_top = kNoHud;
         vblank = false;
         sprite0_hit = false;
         sprite_overflow = false;
     }
-    line_g++;
-    next_line_t = (line_g * 341) / 3;
+    ppu_dot_pos++;
+    if (++ppu_dot == kDotsPerLine) {
+        ppu_dot = 0;
+        ppu_line = (ppu_line + 1) % kLinesPerFrame;
+    }
 }
 
 void Machine::run_frame() {

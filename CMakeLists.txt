@@ -12,7 +12,10 @@ find_package(Python3 REQUIRED COMPONENTS Interpreter)
 # The user's own ROM. Never committed; the translator verifies its bytes.
 set(SMB3_ROM "${CMAKE_SOURCE_DIR}/Super Mario Bros. 3 (U) (PRG1) [!].nes" CACHE FILEPATH
     "Path to the user's legally obtained SMB3 (U) PRG1 ROM")
-set(SMB3_SRC "${CMAKE_SOURCE_DIR}/third_party/smb3/smb3.asm")
+# Vendored disassembly subset (smb3.asm + the PRG sources it includes; textures,
+# editor files and binaries stripped). From captainsouthbird/smb3 at 09b1bd8.
+set(SMB3_SRC "${CMAKE_SOURCE_DIR}/tools/translate/smb3-src/smb3.asm" CACHE FILEPATH
+    "Path to smb3.asm from the vendored SMB3 disassembly subset")
 set(GEN_DIR "${CMAKE_BINARY_DIR}/gen")
 set(ASSET_DIR "${CMAKE_SOURCE_DIR}/assets")
 
@@ -49,10 +52,16 @@ add_custom_command(
 add_custom_target(smb3_translate DEPENDS ${GENERATED_BANKS} "${GEN_DIR}/bank_table.inc")
 
 # 3) Runtime core and generated code.
+# Linear Blargg APU (Nes_Snd_Emu 0.1.7, single Blip_Buffer). Nonlinear_Buffer is
+# intentionally not compiled in.
 add_library(smb3_core STATIC
     src/runtime/machine.cpp
     src/runtime/ppu.cpp
     src/runtime/apu.cpp
+    src/runtime/nes_apu/Blip_Buffer.cpp
+    src/runtime/nes_apu/Nes_Apu.cpp
+    src/runtime/nes_apu/Nes_Oscs.cpp
+    src/runtime/nes_apu/apu_snapshot.cpp
     ${GENERATED_BANKS}
 )
 target_include_directories(smb3_core PUBLIC src ${GEN_DIR})
