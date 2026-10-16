@@ -10,8 +10,17 @@ endif()
 find_package(Python3 REQUIRED COMPONENTS Interpreter)
 
 # The user's own ROM. Never committed; the translator verifies its bytes.
+# Both the GoodNES and No-Intro filenames are accepted out of the box.
 set(SMB3_ROM "${CMAKE_SOURCE_DIR}/Super Mario Bros. 3 (U) (PRG1) [!].nes" CACHE FILEPATH
     "Path to the user's legally obtained SMB3 (U) PRG1 ROM")
+if(NOT EXISTS "${SMB3_ROM}")
+    set(_smb3_alt "${CMAKE_SOURCE_DIR}/Super Mario Bros. 3 (USA) (Rev 1).nes")
+    if(EXISTS "${_smb3_alt}")
+        message(STATUS "SMB3 ROM not found at ${SMB3_ROM}; using ${_smb3_alt}")
+        set(SMB3_ROM "${_smb3_alt}" CACHE FILEPATH
+            "Path to the user's legally obtained SMB3 (U) PRG1 ROM" FORCE)
+    endif()
+endif()
 # Vendored disassembly subset (smb3.asm + the PRG sources it includes; textures,
 # editor files and binaries stripped). From captainsouthbird/smb3 at 09b1bd8.
 set(SMB3_SRC "${CMAKE_SOURCE_DIR}/tools/translate/smb3-src/smb3.asm" CACHE FILEPATH

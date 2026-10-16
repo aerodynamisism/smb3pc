@@ -54,7 +54,8 @@ with Vulkan video and SDL3 audio.
 - CMake 3.20+, Ninja or Make, a C++17 compiler, Python 3, git
 - Vulkan SDK or driver headers, `glslc` (for the shaders)
 - SDL3 (found through pkg-config)
-- `Super Mario Bros. 3 (U) (PRG1) [!].nes` in the repo root, or set
+- `Super Mario Bros. 3 (U) (PRG1) [!].nes` or
+  `Super Mario Bros. 3 (USA) (Rev 1).nes` in the repo root, or set
   `-DSMB3_ROM=/path/to/rom.nes`
 
 Without SDL3, Vulkan, or glslc the desktop app is skipped. The headless
