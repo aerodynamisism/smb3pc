@@ -4,7 +4,7 @@
 
 #include <cstdint>
 
-constexpr int kMenuItems = 3;  // fullscreen, FPS counter, resume
+constexpr int kMenuItems = 3;  // fullscreen, FPS counter, audio mix
 
 enum class MenuAction { Up, Down, Select };
 
@@ -12,8 +12,11 @@ struct MenuView {
     int selected = 0;
     bool fullscreen = false;
     bool show_fps = false;
+    bool nonlinear_audio = false;
 };
 
 // fb: 256 * 240 RGBA words, R in the lowest byte.
-void draw_fps(uint32_t* fb, int fps);
-void draw_menu(uint32_t* fb, const MenuView& view);
+// chr: 128 KB CHR ROM holding the game's 2bpp tiles; menu text and icons are
+// drawn from the in-game dialog font (CHR banks $5E/$5F).
+void draw_fps(uint32_t* fb, int fps, const uint8_t* chr);
+void draw_menu(uint32_t* fb, const MenuView& view, const uint8_t* chr);

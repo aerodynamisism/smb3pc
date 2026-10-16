@@ -8,62 +8,17 @@ namespace {
 constexpr int kW = 256;
 constexpr int kH = 240;
 
+// Menu colours: NES $0F black panel fill, $36 peach ink (#F0D0B0) for the
+// map-border look.
 // Colours in the framebuffer layout: R in the lowest byte, opaque alpha in the highest.
 constexpr uint32_t rgb(uint32_t r, uint32_t g, uint32_t b) {
     return r | (g << 8) | (b << 16) | 0xFF000000u;
 }
-constexpr uint32_t kBlack = rgb(0, 0, 0);
-constexpr uint32_t kWhite = rgb(255, 255, 255);
-constexpr uint32_t kYellow = rgb(255, 224, 64);
-
-// Glyph order matches kGlyphChars. Each glyph is seven rows, top first; the low five bits of a
-// row are the pixels, leftmost in bit 4.
-constexpr char kGlyphChars[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789:.->/";
-constexpr uint8_t kGlyphs[41][7] = {
-    {0x0E, 0x11, 0x11, 0x1F, 0x11, 0x11, 0x11},  // A
-    {0x1E, 0x11, 0x11, 0x1E, 0x11, 0x11, 0x1E},  // B
-    {0x0E, 0x11, 0x10, 0x10, 0x10, 0x11, 0x0E},  // C
-    {0x1C, 0x12, 0x11, 0x11, 0x11, 0x12, 0x1C},  // D
-    {0x1F, 0x10, 0x10, 0x1E, 0x10, 0x10, 0x1F},  // E
-    {0x1F, 0x10, 0x10, 0x1E, 0x10, 0x10, 0x10},  // F
-    {0x0E, 0x11, 0x10, 0x17, 0x11, 0x11, 0x0F},  // G
-    {0x11, 0x11, 0x11, 0x1F, 0x11, 0x11, 0x11},  // H
-    {0x0E, 0x04, 0x04, 0x04, 0x04, 0x04, 0x0E},  // I
-    {0x07, 0x02, 0x02, 0x02, 0x02, 0x12, 0x0C},  // J
-    {0x11, 0x12, 0x14, 0x18, 0x14, 0x12, 0x11},  // K
-    {0x10, 0x10, 0x10, 0x10, 0x10, 0x10, 0x1F},  // L
-    {0x11, 0x1B, 0x15, 0x15, 0x11, 0x11, 0x11},  // M
-    {0x11, 0x11, 0x19, 0x15, 0x13, 0x11, 0x11},  // N
-    {0x0E, 0x11, 0x11, 0x11, 0x11, 0x11, 0x0E},  // O
-    {0x1E, 0x11, 0x11, 0x1E, 0x10, 0x10, 0x10},  // P
-    {0x0E, 0x11, 0x11, 0x11, 0x15, 0x12, 0x0D},  // Q
-    {0x1E, 0x11, 0x11, 0x1E, 0x14, 0x12, 0x11},  // R
-    {0x0F, 0x10, 0x10, 0x0E, 0x01, 0x01, 0x1E},  // S
-    {0x1F, 0x04, 0x04, 0x04, 0x04, 0x04, 0x04},  // T
-    {0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x0E},  // U
-    {0x11, 0x11, 0x11, 0x11, 0x11, 0x0A, 0x04},  // V
-    {0x11, 0x11, 0x11, 0x15, 0x15, 0x15, 0x0A},  // W
-    {0x11, 0x11, 0x0A, 0x04, 0x0A, 0x11, 0x11},  // X
-    {0x11, 0x11, 0x0A, 0x04, 0x04, 0x04, 0x04},  // Y
-    {0x1F, 0x01, 0x02, 0x04, 0x08, 0x10, 0x1F},  // Z
-    {0x0E, 0x11, 0x13, 0x15, 0x19, 0x11, 0x0E},  // 0
-    {0x04, 0x0C, 0x04, 0x04, 0x04, 0x04, 0x0E},  // 1
-    {0x0E, 0x11, 0x01, 0x02, 0x04, 0x08, 0x1F},  // 2
-    {0x1F, 0x02, 0x04, 0x02, 0x01, 0x11, 0x0E},  // 3
-    {0x02, 0x06, 0x0A, 0x12, 0x1F, 0x02, 0x02},  // 4
-    {0x1F, 0x10, 0x1E, 0x01, 0x01, 0x11, 0x0E},  // 5
-    {0x06, 0x08, 0x10, 0x1E, 0x11, 0x11, 0x0E},  // 6
-    {0x1F, 0x01, 0x02, 0x04, 0x08, 0x08, 0x08},  // 7
-    {0x0E, 0x11, 0x11, 0x0E, 0x11, 0x11, 0x0E},  // 8
-    {0x0E, 0x11, 0x11, 0x0F, 0x01, 0x02, 0x0C},  // 9
-    {0x00, 0x04, 0x04, 0x00, 0x04, 0x04, 0x00},  // :
-    {0x00, 0x00, 0x00, 0x00, 0x00, 0x0C, 0x0C},  // .
-    {0x00, 0x00, 0x00, 0x1F, 0x00, 0x00, 0x00},  // -
-    {0x10, 0x08, 0x04, 0x02, 0x04, 0x08, 0x10},  // >
-    {0x01, 0x02, 0x02, 0x04, 0x08, 0x08, 0x10},  // /
-};
-
-constexpr int kAdvance = 6;  // 5-pixel glyph plus one pixel of spacing
+constexpr uint32_t kBlack = rgb(0x00, 0x00, 0x00);  // NES $0F, text and markers
+constexpr uint32_t kSelect = rgb(0xF8, 0x38, 0x00);  // NES $16, selector arrow
+constexpr uint32_t kPeach = rgb(0xF0, 0xD0, 0xB0);  // NES $36, panel fill
+constexpr uint32_t kPeachDim = rgb(0x78, 0x68, 0x58);  // selected-but-off markers
+constexpr uint32_t kPaper = rgb(0xFC, 0xFC, 0xFC);  // NES $30, border trim
 
 void put(uint32_t* fb, int x, int y, uint32_t color) {
     if (x >= 0 && x < kW && y >= 0 && y < kH) fb[y * kW + x] = color;
@@ -75,58 +30,205 @@ void fill_rect(uint32_t* fb, int x, int y, int w, int h, uint32_t color) {
     }
 }
 
-const uint8_t* find_glyph(char c) {
+// In-game font: SMB3's dialog/status font lives in CHR banks $5E/$5F. The
+// dialog message bytes in the disassembly are raw tile indices into the
+// pattern page those banks map ($80-$FF), which pins the layout: uppercase
+// A-P at (5E,48-63), Q-X at (5F,0-7), Y/Z at (5F,8-9), digits at (5F,48-57)
+// (e.g. O=$BE -> (5E,62), T=$C3 -> (5F,3), 0-9 verified on proof sheets).
+// The on/off marker is a solid block tile; off is an empty slot.
+struct FontTile {
+    uint8_t bank;
+    uint8_t tile;
+};
+
+bool font_tile(char c, FontTile& t) {
     if (c >= 'a' && c <= 'z') c = static_cast<char>(c - 'a' + 'A');
-    for (int i = 0; kGlyphChars[i] != '\0'; i++) {
-        if (kGlyphChars[i] == c) return kGlyphs[i];
+    if (c >= 'A' && c <= 'P') {
+        t = FontTile{0x5E, static_cast<uint8_t>(48 + (c - 'A'))};
+        return true;
     }
-    return nullptr;  // space and anything else is blank
+    if (c >= 'Q' && c <= 'X') {
+        t = FontTile{0x5F, static_cast<uint8_t>(c - 'Q')};
+        return true;
+    }
+    if (c == 'Y') {
+        t = FontTile{0x5F, 8};
+        return true;
+    }
+    if (c == 'Z') {
+        t = FontTile{0x5F, 9};
+        return true;
+    }
+    if (c >= '0' && c <= '9') {
+        t = FontTile{0x5F, static_cast<uint8_t>(48 + (c - '0'))};
+        return true;
+    }
+    return false;  // space and anything else is blank
 }
 
-void draw_text(uint32_t* fb, int x, int y, const char* text, uint32_t color) {
-    for (const char* c = text; *c != '\0'; c++, x += kAdvance) {
-        const uint8_t* g = find_glyph(*c);
-        if (!g) continue;
-        for (int row = 0; row < 7; row++) {
-            for (int col = 0; col < 5; col++) {
-                if (g[row] & (0x10 >> col)) put(fb, x + col, y + row, color);
+// Blits one 8x8 2bpp CHR tile. Value 3 is transparent (the fill behind shows
+// through), unless opaque is set, which paints it black instead — used by the
+// border so no tan shows outside its white lines. Text uses the outline form
+// (values 0/2), which keeps digits readable; the border uses the solid form
+// (any nonzero value).
+void draw_tile(uint32_t* fb, int x, int y, const uint8_t* chr, FontTile t, uint32_t color,
+               bool solid, bool flip = false, bool opaque = false) {
+    const uint8_t* g = chr + static_cast<size_t>(t.bank) * 1024 + static_cast<size_t>(t.tile) * 16;
+    for (int row = 0; row < 8; row++) {
+        const uint8_t lo = g[row];
+        const uint8_t hi = g[row + 8];
+        for (int col = 0; col < 8; col++) {
+            const int sc = flip ? col : 7 - col;
+            const unsigned v = (((hi >> sc) & 1) << 1) | ((lo >> sc) & 1);
+            if (v == 3 || (!solid && v == 1)) {
+                if (opaque) put(fb, x + col, y + row, kBlack);
+                continue;
+            }
+            put(fb, x + col, y + row, color);
+        }
+    }
+}
+
+
+constexpr int kAdvance = 9;  // 8px glyphs plus 1px so stroked neighbours never touch
+
+void draw_gametext(uint32_t* fb, int x, int y, const char* text, const uint8_t* chr) {
+    // Two passes for the HUD look: white cores with a 1px black rim, the
+    // same stroke weight as the in-game HUD glyphs.
+    for (int pass = 0; pass < 2; pass++) {
+        int gx = x;
+        for (const char* c = text; *c != '\0'; c++, gx += kAdvance) {
+            FontTile t{0, 0};
+            if (!font_tile(*c, t)) continue;
+            if (pass == 0) {
+                const uint8_t* g =
+                    chr + static_cast<size_t>(t.bank) * 1024 + static_cast<size_t>(t.tile) * 16;
+                for (int row = 0; row < 8; row++) {
+                    const uint8_t lo = g[row];
+                    const uint8_t hi = g[row + 8];
+                    for (int col = 0; col < 8; col++) {
+                        const unsigned v = (((hi >> (7 - col)) & 1) << 1) | ((lo >> (7 - col)) & 1);
+                        if (v == 3 || v == 1) continue;
+                        for (int dy = -1; dy <= 1; dy++) {
+                            for (int dx = -1; dx <= 1; dx++)
+                                put(fb, gx + col + dx, y + row + dy, kBlack);
+                        }
+                    }
+                }
+            } else {
+                draw_tile(fb, gx, y, chr, t, kPaper, false);
             }
         }
     }
 }
 
-int text_width(const char* text) {
-    return static_cast<int>(std::strlen(text)) * kAdvance;
+int gametext_width(const char* text) {
+    int n = 0;
+    for (const char* c = text; *c != '\0'; c++) n++;
+    return n * kAdvance;
+}
+
+void put_mark(uint32_t* fb, int x, int y, uint32_t color) {
+    put(fb, x, y, color);
+    put(fb, x + 1, y, color);
+}
+
+// Check mark in an 8x8 cell: short arm down-right, long arm up-right.
+void draw_check(uint32_t* fb, int x, int y, uint32_t color) {
+    for (int i = 0; i < 3; i++) {
+        put_mark(fb, x + 1 + i, y + 4 + i, color);
+    }
+    for (int i = 0; i < 4; i++) {
+        put_mark(fb, x + 3 + i, y + 6 - i, color);
+    }
+}
+
+// Cross mark in an 8x8 cell: two diagonals.
+void draw_cross(uint32_t* fb, int x, int y, uint32_t color) {
+    for (int i = 0; i < 6; i++) {
+        put_mark(fb, x + 1 + i, y + 1 + i, color);
+        put_mark(fb, x + 5 - i, y + 1 + i, color);
+    }
+}
+
+// Cursor: filled right-pointing triangle with a 1px black rim. (The two
+// arrow-like tiles at (5F,2E)/(5F,2F) are halves of one 16px map object, so
+// neither works alone in the 8px cursor cell.)
+void draw_cursor(uint32_t* fb, int x, int y) {
+    for (int row = 0; row < 8; row++) {
+        const int half = row < 4 ? row : 7 - row;
+        for (int col = 0; col <= half + 1; col++) {
+            for (int dy = -1; dy <= 1; dy++) {
+                for (int dx = -1; dx <= 1; dx++) put(fb, x + col + dx, y + row + dy, kBlack);
+            }
+        }
+    }
+    for (int row = 0; row < 8; row++) {
+        const int half = row < 4 ? row : 7 - row;
+        for (int col = 0; col <= half + 1; col++) {
+            put(fb, x + col, y + row, kSelect);
+        }
+    }
 }
 
 }  // namespace
 
-void draw_fps(uint32_t* fb, int fps) {
+void draw_fps(uint32_t* fb, int fps, const uint8_t* chr) {
     char text[16];
     std::snprintf(text, sizeof text, "FPS %d", fps);
-    // Inside the 8-pixel overscan crop, so it stays visible.
-    fill_rect(fb, 10, 10, text_width(text) + 3, 9, kBlack);
-    draw_text(fb, 12, 11, text, kYellow);
+    // Inside the 8-pixel overscan crop, so it stays visible. No backing box:
+    // the stroked glyphs stay readable over gameplay on their own.
+    draw_gametext(fb, 12, 11, text, chr);
 }
 
-void draw_menu(uint32_t* fb, const MenuView& view) {
-    constexpr int x0 = 60, y0 = 64, w = 136, h = 84;
-    fill_rect(fb, x0, y0, w, h, kBlack);
-    fill_rect(fb, x0, y0, w, 1, kWhite);
-    fill_rect(fb, x0, y0 + h - 1, w, 1, kWhite);
-    fill_rect(fb, x0, y0, 1, h, kWhite);
-    fill_rect(fb, x0 + w - 1, y0, 1, h, kWhite);
-
-    draw_text(fb, x0 + 10, y0 + 8, "MENU", kYellow);
-
-    const char* labels[kMenuItems] = {"FULLSCREEN", "FPS COUNTER", "RESUME"};
-    for (int i = 0; i < kMenuItems; i++) {
-        const int y = y0 + 24 + i * 14;
-        const uint32_t color = i == view.selected ? kYellow : kWhite;
-        if (i == view.selected) draw_text(fb, x0 + 6, y, ">", kYellow);
-        draw_text(fb, x0 + 14, y, labels[i], color);
-        if (i == 0) draw_text(fb, x0 + 86, y, view.fullscreen ? "ON" : "OFF", color);
-        if (i == 1) draw_text(fb, x0 + 86, y, view.show_fps ? "ON" : "OFF", color);
+void draw_menu(uint32_t* fb, const MenuView& view, const uint8_t* chr) {
+    // Tile-aligned black panel framed with the world-map status strip border
+    // (CHR bank $5E on the $0000 page). The right-side corner tiles read as
+    // proper corners, so the left side mirrors them with a horizontal flip.
+    constexpr int x0 = 32, y0 = 56, w = 192, h = 88;
+    constexpr FontTile kTop{0x5E, 0x21}, kBottom{0x5E, 0x24};
+    constexpr FontTile kLeft{0x5E, 0x26}, kRight{0x5E, 0x27};
+    constexpr FontTile kTopCorner{0x5E, 0x22}, kBottomCorner{0x5E, 0x25};
+    auto edge = [&](int x, int y, FontTile t) { draw_tile(fb, x, y, chr, t, kPaper, false, false, true); };
+    // Full-box black backing first: border tiles leave transparent pixels that
+    // must fall back to black, never the game frame behind the menu.
+    fill_rect(fb, x0, y0, w, h, kPeach);
+    for (int x = x0 + 8; x < x0 + w - 8; x += 8) {
+        edge(x, y0, kTop);
+        edge(x, y0 + h - 8, kBottom);
     }
-    draw_text(fb, x0 + 10, y0 + h - 12, "ESC TO CLOSE", kWhite);
+    for (int y = y0 + 8; y < y0 + h - 8; y += 8) {
+        edge(x0, y, kLeft);
+        edge(x0 + w - 8, y, kRight);
+    }
+    draw_tile(fb, x0, y0, chr, kTopCorner, kPaper, false, true, true);
+    draw_tile(fb, x0 + w - 8, y0, chr, kTopCorner, kPaper, false, false, true);
+    draw_tile(fb, x0, y0 + h - 8, chr, kBottomCorner, kPaper, false, true, true);
+    draw_tile(fb, x0 + w - 8, y0 + h - 8, chr, kBottomCorner, kPaper, false, false, true);
+    constexpr int label_x = x0 + 20;
+    constexpr int cursor_x = x0 + 10;
+    constexpr int icon_x = x0 + 126;
+    constexpr int value_x = x0 + 30;
+
+    draw_gametext(fb, x0 + (w - gametext_width("SETTINGS")) / 2, y0 + 10, "Settings", chr);
+
+    const char* labels[kMenuItems] = {"FULLSCREEN", "FPS COUNTER", "AUDIO MIX"};
+    const int ys[kMenuItems] = {y0 + 26, y0 + 40, y0 + 54};
+    for (int i = 0; i < kMenuItems; i++) {
+        draw_gametext(fb, label_x, ys[i], labels[i], chr);
+    }
+    draw_cursor(fb, cursor_x, ys[view.selected] - 1);
+    // Check when on, cross when selected-but-off so state stays distinguishable.
+    if (view.fullscreen) {
+        draw_check(fb, icon_x, ys[0], kBlack);
+    } else if (view.selected == 0) {
+        draw_cross(fb, icon_x, ys[0], kPeachDim);
+    }
+    if (view.show_fps) {
+        draw_check(fb, icon_x, ys[1], kBlack);
+    } else if (view.selected == 1) {
+        draw_cross(fb, icon_x, ys[1], kPeachDim);
+    }
+    draw_gametext(fb, value_x, ys[2] + 14,
+                  view.nonlinear_audio ? "HARDWARE ACCURATE" : "REMASTERED", chr);
 }

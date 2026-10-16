@@ -52,8 +52,9 @@ add_custom_command(
 add_custom_target(smb3_translate DEPENDS ${GENERATED_BANKS} "${GEN_DIR}/bank_table.inc")
 
 # 3) Runtime core and generated code.
-# Linear Blargg APU (Nes_Snd_Emu 0.1.7, single Blip_Buffer). Nonlinear_Buffer is
-# intentionally not compiled in.
+# Blargg APU (Nes_Snd_Emu 0.1.7, linear mixer plus a hardware-curve nonlinear
+# mixer in src/runtime/apu.cpp). Nonlinear_Buffer is intentionally not
+# compiled in.
 add_library(smb3_core STATIC
     src/runtime/machine.cpp
     src/runtime/ppu.cpp

@@ -4,8 +4,9 @@
 //   smb3pc [--assets DIR] [--shaders DIR] [--config FILE]
 //
 // Default keys: arrows = D-pad, X = A, Z = B, Enter = Start, Right Shift = Select,
-// F11 = menu (fullscreen, FPS counter), Esc = quit (or close the menu). Gamepad: South = A, East = B, Back = Select,
-// Start = Start, D-pad = D-pad. Remap either in smb3pc.cfg (see smb3pc.cfg.example).
+// F11 = menu (fullscreen, FPS counter, audio mix), Esc = quit. Gamepad: South = A, East = B, Back = Select,
+// Start = Start, D-pad = D-pad. Remap keys in settings.cfg (see README).
+// Menu settings (fullscreen, FPS counter, audio mix) persist in settings.cfg.
 #include <SDL3/SDL.h>
 
 #include <algorithm>
@@ -19,6 +20,7 @@
 
 #include "app/overlay.h"
 #include "app/presenter.h"
+#include "app/settings.h"
 #include "runtime/machine.h"
 
 #ifndef SMB3_ASSET_DIR
@@ -76,10 +78,7 @@ bool load_bindings(const std::string& path, Bindings& b) {
         const std::string value = trim(t.substr(eq + 1));
         const bool is_key = name.rfind("key.", 0) == 0;
         const bool is_pad = name.rfind("pad.", 0) == 0;
-        if (!is_key && !is_pad) {
-            std::fprintf(stderr, "%s:%d: unknown setting '%s'\n", path.c_str(), lineno, name.c_str());
-            return false;
-        }
+        if (!is_key && !is_pad) continue;  // menu settings live in the same file
         const std::string button = name.substr(4);
         int idx = -1;
         for (int i = 0; i < kNesButtons; i++) {
@@ -118,7 +117,7 @@ std::vector<uint8_t> read_file(const std::string& path) {
 int main(int argc, char** argv) {
     std::string assets = SMB3_ASSET_DIR;
     std::string shaders = SMB3_SHADER_DIR;
-    std::string config = "smb3pc.cfg";
+    std::string config = "settings.cfg";
     for (int i = 1; i < argc; i++) {
         std::string arg = argv[i];
         if (arg == "--assets" && i + 1 < argc) assets = argv[++i];
@@ -126,6 +125,10 @@ int main(int argc, char** argv) {
         else if (arg == "--config" && i + 1 < argc) config = argv[++i];
     }
 
+    // Menu settings and controller bindings share one file (missing file keeps
+    // the defaults; an old bindings-only smb3pc.cfg loads fine as well).
+    AppSettings app_settings;
+    settings::load(config, app_settings);
     Bindings bindings;
     if (!load_bindings(config, bindings)) return 1;
 
@@ -149,6 +152,7 @@ int main(int argc, char** argv) {
         SDL_Quit();
         return 1;
     }
+    if (app_settings.fullscreen) SDL_SetWindowFullscreen(window, true);
 
     // Mono int16 at the APU output rate. Without an audio device the game runs on the frame timer.
     SDL_AudioSpec spec{};
@@ -178,6 +182,7 @@ int main(int argc, char** argv) {
         exit_code = 1;
     } else {
         m->reset();
+        m->apu.set_mixing(app_settings.mixing);
         uint8_t kb_state = 0;   // keyboard contribution to the pad byte
         uint8_t gp_state = 0;   // gamepad contribution
         bool running = true;
@@ -189,12 +194,25 @@ int main(int argc, char** argv) {
         bool r3_down = false;
         bool chord_fired = false;
         int menu_sel = 0;
-        bool show_fps = false;
+        bool show_fps = app_settings.show_fps;
+        bool nonlinear_audio = app_settings.mixing == Mixing::Nonlinear;
+        // Fullscreen is tracked here, not read back from the window: on some
+        // platforms (notably Wayland) the window flags update asynchronously,
+        // so a read-back right after toggling can return the old state.
+        bool fullscreen = app_settings.fullscreen;
+        // Menu toggles persist immediately so they survive even a crash.
+        auto save_settings = [&]() {
+            app_settings.fullscreen = fullscreen;
+            app_settings.show_fps = show_fps;
+            app_settings.mixing = nonlinear_audio ? Mixing::Nonlinear : Mixing::Linear;
+            if (!settings::save(config, app_settings)) {
+                std::fprintf(stderr, "cannot write %s\n", config.c_str());
+            }
+        };
         int fps_shown = 0;
         int fps_frames = 0;
         uint64_t fps_t0 = SDL_GetTicksNS();
         std::vector<uint32_t> screen(256 * 240);
-        auto is_fullscreen = [&]() { return (SDL_GetWindowFlags(window) & SDL_WINDOW_FULLSCREEN) != 0; };
         auto menu_action = [&](MenuAction act) {
             switch (act) {
                 case MenuAction::Up:
@@ -205,11 +223,21 @@ int main(int argc, char** argv) {
                     break;
                 case MenuAction::Select:
                     if (menu_sel == 0) {
-                        SDL_SetWindowFullscreen(window, !is_fullscreen());
+                        fullscreen = !fullscreen;
+                        if (!SDL_SetWindowFullscreen(window, fullscreen)) {
+                            std::fprintf(stderr, "cannot set fullscreen: %s\n", SDL_GetError());
+                            fullscreen = !fullscreen;
+                        }
+                        save_settings();
                     } else if (menu_sel == 1) {
                         show_fps = !show_fps;
+                        save_settings();
+                    } else if (menu_sel == 2) {
+                        nonlinear_audio = !nonlinear_audio;
+                        m->apu.set_mixing(nonlinear_audio ? Mixing::Nonlinear : Mixing::Linear);
+                        save_settings();
                     } else {
-                        menu_open = false;  // resume
+                        menu_open = false;  // unreachable, but never trap the player
                     }
                     break;
             }
@@ -217,8 +245,10 @@ int main(int argc, char** argv) {
         // The frame to show: the NES picture with the overlays that are on.
         auto compose = [&](const uint32_t* src) {
             std::memcpy(screen.data(), src, sizeof(uint32_t) * screen.size());
-            if (show_fps) draw_fps(screen.data(), fps_shown);
-            if (menu_open) draw_menu(screen.data(), MenuView{menu_sel, is_fullscreen(), show_fps});
+            if (show_fps) draw_fps(screen.data(), fps_shown, m->chr);
+            if (menu_open)
+                draw_menu(screen.data(), MenuView{menu_sel, fullscreen, show_fps, nonlinear_audio},
+                          m->chr);
             return static_cast<const uint32_t*>(screen.data());
         };
         while (running) {
@@ -235,11 +265,7 @@ int main(int argc, char** argv) {
                             menu_open = !menu_open;
                             menu_sel = 0;
                         } else if (down && ev.key.scancode == SDL_SCANCODE_ESCAPE) {
-                            if (menu_open) {
-                                menu_open = false;
-                            } else {
-                                running = false;
-                            }
+                            running = false;
                         } else if (menu_open && down && !ev.key.repeat) {
                             if (ev.key.scancode == SDL_SCANCODE_UP) {
                                 menu_action(MenuAction::Up);

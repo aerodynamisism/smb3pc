@@ -24,11 +24,14 @@ with Vulkan video and SDL3 audio.
 - Vulkan presenter with nearest-filtered fullscreen triangle
 - Square pixels, fitted inside the window with pillarbox/letterbox
 - Overscan crop: 8 pixels per side, leaving 240 of 256 columns
-- On-screen menu and FPS counter drawn into the frame (bitmap font, no text library)
+- On-screen menu and FPS counter drawn into the frame with the game's own
+  font tiles (white text with black outline, no text library)
 
 **Audio**
 
 - 2A03 APU on Blargg Nes_Snd_Emu 0.1.7, linear mixing through one `Blip_Buffer`
+- Optional nonlinear mixer: per-channel buffers combined with the hardware
+  mixer curves at hardware-relative levels (menu only, off by default)
 - 48 kHz mono int16 output over SDL3; cycle-stamped register writes
 - Output-rate nudge (±0.5%) holds the device queue at its target
 - DMC fetches sample bytes from CPU memory
@@ -36,8 +39,8 @@ with Vulkan video and SDL3 audio.
 **Input**
 
 - Keyboard and gamepad (SDL3), with hot-plug support
-- Remappable via `smb3pc.cfg`; unknown names fail fast with a clear message
-- In-game menu: fullscreen toggle, FPS counter, resume (pauses the game)
+- Remappable via `settings.cfg`; unknown names fail fast with a clear message
+- In-game menu: fullscreen toggle, FPS counter, audio mix (pauses the game)
 
 **Tools**
 
@@ -91,24 +94,44 @@ translator checks every item against the ROM.
 | B | Z | East (B/Circle) |
 | Select | Right Shift | Back |
 | Start | Enter | Start |
-| Menu (fullscreen, FPS counter) | F11 | L3 + R3 |
-| Quit (closes the menu first, if open) | Esc | — |
+| Menu (fullscreen, FPS counter, audio mix) | F11 | L3 + R3 |
+| Quit | Esc | — |
 
 F11 (or L3+R3 on a gamepad) opens a menu over the game and pauses it.
 Up and Down move the cursor; Enter or X selects (D-pad and South on a
-gamepad). East or Start closes the menu on a gamepad. Menu items:
-Fullscreen, FPS counter, Resume.
+gamepad). East or Start closes the menu on a gamepad; Esc quits the program.
+Menu items: Fullscreen, FPS counter, Audio mix (Remastered/Hardware Accurate).
+On/off states show check/cross icons; the selected row gets a red-orange
+arrow cursor. The menu is drawn with the game's own font tiles inside a
+world-map status strip frame: white stroked text on tan with white trim.
+The Hardware Accurate mixer is new and ear-unverified; its checks so far are
+numeric only. Close the menu with F11 (L3+R3 on a gamepad).
 
 Picture keeps square pixels and fits inside the window: it is scaled to fill
 as much as possible, and any leftover area is black (pillarbox/letterbox).
 Nothing is cropped by the window fit. The startup window is 720x720, exactly
 3x the visible 240x240 picture.
 
-### Remapping
+### Settings
 
-Copy `smb3pc.cfg.example` to `smb3pc.cfg` and edit it. Key names and gamepad
-button names are SDL's. An unknown name is reported and the program exits.
+Menu choices and controller remapping share `settings.cfg` in the working
+directory (gitignored). It is written every time a menu item is toggled, so
+settings survive even a crash; bindings you add by hand are preserved. A
+missing file keeps the defaults; a bad menu value warns and keeps that key's
+default, while a bad binding name or value is reported and the program exits.
 Use `--config FILE` to load a different file.
+
+| Key | Default | Meaning |
+| --- | --- | --- |
+| `video.fullscreen` | `0` | Start in fullscreen (`0`/`1`) |
+| `video.show_fps` | `0` | Show the emulated frame rate (`0`/`1`) |
+| `audio.mixing` | `linear` | APU mixer: `linear` (Remastered) or `nonlinear` (Hardware Accurate) |
+| `key.BUTTON` | (see below) | Keyboard remap, e.g. `key.a = X`; names are SDL's |
+| `pad.BUTTON` | (see below) | Gamepad remap, e.g. `pad.a = south`; names are SDL gamepad buttons |
+
+Buttons: `a`, `b`, `select`, `start`, `up`, `down`, `left`, `right`. Defaults:
+keyboard arrows = D-pad, `X` = A, `Z` = B, Right Shift = Select, Enter = Start;
+gamepad South = A, East = B, Back = Select, Start = Start, D-pad = D-pad.
 
 ---
 
@@ -151,5 +174,9 @@ frame, exactly as in the desktop app.
 - The APU core, Shay Green's Nes_Snd_Emu (used here in linear-mixing
   configuration through a single `Blip_Buffer`; LGPL 2.1, see
   `src/runtime/nes_apu/LGPL.txt`).
+- The PPU, modelled after Ulf Magnusson's
+  [nesalizer](https://github.com/ulfalizer/nesalizer), with fetch sequencing
+  cross-checked against Sour's [Mesen](https://github.com/nesdev-org/MesenCE)
+  (`NesPpu`; rewritten, no Mesen code).
 - Nintendo created Super Mario Bros. 3. This project is not affiliated with
   or endorsed by Nintendo.
