@@ -1,5 +1,6 @@
 #include "runtime/machine.h"
 
+#include <algorithm>
 #include <climits>
 #include <cstdio>
 #include <cstdlib>
@@ -23,6 +24,13 @@ constexpr int64_t kA12FilterDots = 9;  // A12 must stay low this long before a r
 void Machine::reset() {
     apu.read_cpu = [this](uint16_t addr) { return rd(addr); };  // DMC sample fetches
     apu.reset();  // linear Blargg APU to power-on state (keeps read_cpu hook)
+    sfx_apu.read_cpu = apu.read_cpu;
+    sfx_apu.reset();
+    // The game enables its channels once at startup, through the music voice set. Effects need the
+    // same enables on their own set, or a note written before the engine's first $4015 write is silent.
+    sfx_apu.write(0x4015, 0x0F, 0);
+    snd_owner = kSndMusic;
+    for (auto& o : snd_sav) o = kSndMusic;
     prg_mode = 0;
     chr_inv = 0;
     mmc3_sel = 0;
@@ -159,10 +167,42 @@ void Machine::wr_io(uint16_t addr, uint8_t val) {
         return;
     }
     if (addr <= 0x4017) {  // APU registers ($4000-$4013, $4015, $4017)
-        apu.write(addr, val, cyc);
+        // The frame counter is shared by both voice sets; everything else goes to the owner's.
+        if (addr == 0x4017 || snd_owner == kSndBoth) {
+            apu.write(addr, val, cyc);
+            sfx_apu.write(addr, val, cyc);
+        } else if (snd_owner == kSndSfx) {
+            sfx_apu.write(addr, val, cyc);
+        } else {
+            apu.write(addr, val, cyc);
+        }
         return;
     }
     if (addr >= 0x6000 && addr < 0x8000) sram[addr & 0x1FFF] = val;
+}
+
+// ---------------------------------------------------------------- sound
+
+void Machine::render_audio(int64_t until_cyc, std::vector<int16_t>& out) {
+    const size_t start = out.size();
+    apu.render(until_cyc, out);
+    std::vector<int16_t> sfx;
+    sfx_apu.render(until_cyc, sfx);
+    // Both voice sets render the same clock span, so their sample counts match. The two outputs are
+    // summed at full level, as the linear mixer defines: nothing is attenuated or compressed. The clamp
+    // only stops 16-bit overflow when both sets peak together.
+    const size_t n = std::min(out.size() - start, sfx.size());
+    for (size_t i = 0; i < n; i++) {
+        int32_t sum = static_cast<int32_t>(out[start + i]) + sfx[i];
+        if (sum > 32767) sum = 32767;
+        if (sum < -32768) sum = -32768;
+        out[start + i] = static_cast<int16_t>(sum);
+    }
+}
+
+void Machine::set_audio_rate_scale(double scale) {
+    apu.set_rate_scale(scale);
+    sfx_apu.set_rate_scale(scale);
 }
 
 // ---------------------------------------------------------------- MMC3

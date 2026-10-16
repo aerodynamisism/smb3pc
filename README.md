@@ -1,4 +1,4 @@
-# smb3pc
+# Super Mario Bros. 3: PC Remastered
 
 A native PC port of Super Mario Bros. 3 (US, PRG1) — the 6502 game code,
 translated to C++ from the SMB3 disassembly, running on a small NES runtime
@@ -29,9 +29,14 @@ with Vulkan video and SDL3 audio.
 
 **Audio**
 
-- 2A03 APU on Blargg Nes_Snd_Emu 0.1.7, linear mixing through one `Blip_Buffer`
-- Optional nonlinear mixer: per-channel buffers combined with the hardware
-  mixer curves at hardware-relative levels (menu only, off by default)
+- 2A03 APU on Blargg Nes_Snd_Emu 0.1.7, linear mixing (no compression) through one `Blip_Buffer` per voice set
+- Music and sound effects run on two separate voice sets (`Machine::apu` and
+  `Machine::sfx_apu`) summed at full level at the output, so an effect never silences or retunes
+  a music channel. The sum is clamped to 16-bit range only. Generated code routes each APU write by owner (translate.py,
+  `SND_ROUTINE_OWNER`).
+- Deliberate deviation from the ROM: the four music gates that skipped music notes
+  while a sound effect was on the same channel are removed (`GATE_TARGETS` in
+  translate.py). The translator reports them and checks each one.
 - 48 kHz mono int16 output over SDL3; cycle-stamped register writes
 - Output-rate nudge (±0.5%) holds the device queue at its target
 - DMC fetches sample bytes from CPU memory
@@ -40,7 +45,7 @@ with Vulkan video and SDL3 audio.
 
 - Keyboard and gamepad (SDL3), with hot-plug support
 - Remappable via `settings.cfg`; unknown names fail fast with a clear message
-- In-game menu: fullscreen toggle, FPS counter, audio mix (pauses the game)
+- In-game menu: fullscreen toggle, FPS counter (pauses the game)
 
 **Tools**
 
@@ -95,18 +100,17 @@ translator checks every item against the ROM.
 | B | Z | East (B/Circle) |
 | Select | Right Shift | Back |
 | Start | Enter | Start |
-| Menu (fullscreen, FPS counter, audio mix) | F11 | L3 + R3 |
+| Menu (fullscreen, FPS counter) | F11 | L3 + R3 |
 | Quit | Esc | — |
 
 F11 (or L3+R3 on a gamepad) opens a menu over the game and pauses it.
 Up and Down move the cursor; Enter or X selects (D-pad and South on a
 gamepad). East or Start closes the menu on a gamepad; Esc quits the program.
-Menu items: Fullscreen, FPS counter, Audio mix (Remastered/Hardware Accurate).
+Menu items: Fullscreen, FPS counter.
 On/off states show check/cross icons; the selected row gets a red-orange
 arrow cursor. The menu is drawn with the game's own font tiles inside a
 world-map status strip frame: white stroked text on tan with white trim.
-The Hardware Accurate mixer is new and ear-unverified; its checks so far are
-numeric only. Close the menu with F11 (L3+R3 on a gamepad).
+Close the menu with F11 (L3+R3 on a gamepad).
 
 Picture keeps square pixels and fits inside the window: it is scaled to fill
 as much as possible, and any leftover area is black (pillarbox/letterbox).
@@ -126,7 +130,6 @@ Use `--config FILE` to load a different file.
 | --- | --- | --- |
 | `video.fullscreen` | `0` | Start in fullscreen (`0`/`1`) |
 | `video.show_fps` | `0` | Show the emulated frame rate (`0`/`1`) |
-| `audio.mixing` | `linear` | APU mixer: `linear` (Remastered) or `nonlinear` (Hardware Accurate) |
 | `key.BUTTON` | (see below) | Keyboard remap, e.g. `key.a = X`; names are SDL's |
 | `pad.BUTTON` | (see below) | Gamepad remap, e.g. `pad.a = south`; names are SDL gamepad buttons |
 

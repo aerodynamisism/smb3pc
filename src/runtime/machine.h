@@ -7,6 +7,7 @@
 
 #include <cstdint>
 #include <cstddef>
+#include <vector>
 
 #include "runtime/apu.h"
 
@@ -110,7 +111,17 @@ struct Machine {
     uint8_t joy_shift[2] = {0, 0};
     bool joy_strobe = false;
 
-    Apu apu;
+    // ---- sound ----
+    // Music and sound effects each drive their own 2A03 voice set, so an effect never silences
+    // or retunes a music channel. Generated code sets snd_owner at the sound routines (see
+    // translate.py, SND_ROUTINE_OWNER) and every APU write is routed by it.
+    enum : uint8_t { kSndMusic = 0, kSndSfx = 1, kSndBoth = 2 };
+    uint8_t snd_owner = kSndMusic;
+    uint8_t snd_sav[256] = {};   // owner saved at each JSR, restored at the matching RTS (indexed by S)
+    Apu apu;                     // music voices; $4015 status reads come from here
+    Apu sfx_apu;                 // sound-effect voices
+    void render_audio(int64_t until_cyc, std::vector<int16_t>& out);  // both voice sets, summed
+    void set_audio_rate_scale(double scale);
 
     // ---- lifecycle ----
     void reset();

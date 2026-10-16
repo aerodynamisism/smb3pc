@@ -789,7 +789,9 @@ def rom_offset(bank, addr):
 def verify(items, syms, rom):
     mismatches = []
     checked = 0
+    prev_instr = None
     for it in items:
+        before, prev_instr = prev_instr, (it if it.kind == "instr" else prev_instr)
         if it.bank is None:
             # Data before the first .bank has no ROM location: it cannot be checked or emitted.
             # RAM .ds reservations are not ROM data, so they are skipped.
@@ -801,6 +803,13 @@ def verify(items, syms, rom):
             it.emit = (data, mode, tgt)
             if it.size is not None and len(data) != it.size:
                 mismatches.append(("size", it, len(data), it.size))
+                continue
+            if is_gate(it):
+                # Deliberate deviation (see GATE_TARGETS): not compared with the ROM bytes,
+                # but the test it guards must be the instruction before it.
+                if before is None or not before.operand or "SndCur_" not in before.operand:
+                    mismatches.append(("gate", it, None, None))
+                GATED_ITEMS.append(it)
                 continue
             expect = rom[rom_offset(it.bank, it.addr):rom_offset(it.bank, it.addr) + len(data)]
             checked += 1
@@ -846,6 +855,44 @@ def verify(items, syms, rom):
 # ---------------------------------------------------------------------------
 # C++ code generation
 # ---------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# Sound ownership and deliberate deviations from the ROM
+# ---------------------------------------------------------------------------
+# Music and sound effects drive two separate APU voice sets (Machine::apu and
+# Machine::sfx_apu). Generated code tags each APU write with the owner in
+# m.snd_owner. A JSR into one of the routines below sets the owner, and the
+# matching RTS restores the caller's owner through m.snd_sav (indexed by S).
+# Other calls inherit the caller's owner, so helpers shared by music and effects
+# (e.g. Sound_Sq1_NoteOn) write for whoever called them.
+SND_MUSIC, SND_SFX, SND_BOTH = 0, 1, 2
+SND_ROUTINE_OWNER = {
+    "Sound_Engine_Begin": SND_SFX,
+    "Sound_PlayMusic": SND_MUSIC,
+    "Sound_PlayLevel1": SND_SFX,
+    "Sound_PlayLevel2": SND_SFX,
+    "Sound_PlayPlayer": SND_SFX,
+    "Sound_PlayMapSounds": SND_SFX,
+}
+# Filled in main() from the resolved symbols.
+SND_OWNER_BY_ADDR = {}
+# [start, end) of the pause routine. Its $4015 writes reach both voice sets, as the
+# original pause silenced every channel.
+SND_PAUSE_RANGE = [0, 0]
+
+# Deliberate deviation from the ROM. In the music code (prg031.asm), each of these
+# BNE branches is a gate: when a sound effect uses the same channel (SndCur_Player /
+# SndCur_Map for square 1, SndCur_Level1 for square 2), the music skips its note or
+# envelope update, so the track stops under the effect. The gate is removed here, so
+# music keeps playing. Each target must be preceded by a test of SndCur_*.
+GATE_TARGETS = ("PRG031_E574", "PRG031_E5A7", "PRG031_E625", "PRG031_E660")
+GATED_ITEMS = []  # filled by verify(), reported by main()
+
+
+def is_gate(it):
+    return (it.kind == "instr" and it.mn == "BNE" and it.operand in GATE_TARGETS
+            and os.path.basename(it.file) == "prg031.asm")
+
+
 FLAG_NZ = "m.nz(%s);"
 
 
@@ -930,6 +977,9 @@ def emit_instr(be, it, data, mode, tgt):
     # Return to the dispatcher before any instruction once an event (line start, MMC3 clock,
     # pending IRQ) is due, so interrupts are taken on the cycle they occur, not at the next label.
     be.out("if (m.cyc >= m.evt) return %s;" % hexa(a))
+    if is_gate(it):
+        be.out("m.cyc += 2;  // gate removed: music ignores sound-effect state (GATE_TARGETS)")
+        return
     if mn in MACRO_BRANCH:
         real = MACRO_BRANCH[mn]
         return emit_branch(be, real, a, data, tgt)
@@ -989,6 +1039,8 @@ def emit_real(be, mn, mode, it, data, tgt):
         val = data[1] | (data[2] << 8)
     cy = base_cycles(mn, mode)
     if mn in ("JSR",):
+        owner = SND_OWNER_BY_ADDR.get(val)
+        be.out("m.snd_sav[m.s] = m.snd_owner;" + ("" if owner is None else " m.snd_owner = %d;" % owner))
         be.out("m.cyc += %d; m.push16(0x%04X);" % (cy, (it.addr + 2) & 0xFFFF))
         be.out("return %s;" % hexa(val))
         return
@@ -1000,7 +1052,7 @@ def emit_real(be, mn, mode, it, data, tgt):
             be.target(val)
         return
     if mn == "RTS":
-        be.out("m.cyc += %d; { uint16_t r = (uint16_t)(m.pull16() + 1); return r; }" % cy)
+        be.out("m.cyc += %d; { uint16_t r = (uint16_t)(m.pull16() + 1); m.snd_owner = m.snd_sav[m.s]; return r; }" % cy)
         return
     if mn == "RTI":
         be.out("m.cyc += %d; m.p = (uint8_t)((m.pull() & ~0x10) | 0x20); "
@@ -1063,6 +1115,10 @@ def emit_real(be, mn, mode, it, data, tgt):
         return
     if mn in ("STA", "STX", "STY"):
         reg = {"STA": "a", "STX": "x", "STY": "y"}[mn]
+        if mode == "abs" and val == 0x4015 and SND_PAUSE_RANGE[0] <= it.addr < SND_PAUSE_RANGE[1]:
+            be.out("m.cyc += %d; { uint8_t keep = m.snd_owner; m.snd_owner = %d; m.wr(0x4015, m.%s); "
+                   "m.snd_owner = keep; }" % (cy, SND_BOTH, reg))
+            return
         be.out("m.cyc += %d; m.wr(%s, m.%s);" % (cy, ea_expr(mode, val), reg))
         return
     if mn in ("AND", "ORA", "EOR"):
@@ -1166,8 +1222,20 @@ def main():
         sys.exit("unresolved symbols: %s" % sorted(unknown)[:20])
     SYMS_REF[0] = syms
 
+    for name, owner in SND_ROUTINE_OWNER.items():
+        if name not in syms:
+            sys.exit("sound routine %s not found in source" % name)
+        SND_OWNER_BY_ADDR[syms[name]] = owner
+    for name in ("SndPause", "Sound_Process"):
+        if name not in syms:
+            sys.exit("pause routine label %s not found in source" % name)
+    SND_PAUSE_RANGE[:] = [syms["SndPause"], syms["Sound_Process"]]
+
     checked, mismatches = verify(items, syms, rom)
     print("verified %d items against ROM; mismatches: %d" % (checked, len(mismatches)))
+    print("deliberate deviations (music gates removed): %d of %d expected" % (len(GATED_ITEMS), len(GATE_TARGETS)))
+    if len(GATED_ITEMS) != len(GATE_TARGETS):
+        sys.exit("expected %d music gates, found %d" % (len(GATE_TARGETS), len(GATED_ITEMS)))
     for kind, it, got, exp in mismatches[:25]:
         print("  MISMATCH %s %s:%d addr=$%04X bank=%s  %s\n    emitted=%s\n    rom    =%s" % (
             kind, it.file, it.line, it.addr or 0, it.bank, it.text,

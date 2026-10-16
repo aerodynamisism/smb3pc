@@ -3,7 +3,6 @@
 // Keys (all optional, one per line, '#' starts a comment):
 //   video.fullscreen = 0|1
 //   video.show_fps   = 0|1
-//   audio.mixing     = linear|nonlinear
 //
 // A missing file keeps the defaults. A bad value warns on stderr and keeps
 // that key's default; unknown keys are ignored so newer files stay readable.
@@ -17,12 +16,9 @@
 #include <string>
 #include <vector>
 
-#include "runtime/apu.h"
-
 struct AppSettings {
     bool fullscreen = false;
     bool show_fps = false;
-    Mixing mixing = Mixing::Linear;
 };
 
 namespace settings {
@@ -62,19 +58,6 @@ inline bool apply_line(const std::string& path, int lineno, const std::string& n
         }
         return true;
     }
-    if (name == "audio.mixing") {
-        const std::string v = lower(value);
-        if (v == "linear") {
-            s.mixing = Mixing::Linear;
-        } else if (v == "nonlinear") {
-            s.mixing = Mixing::Nonlinear;
-        } else {
-            std::fprintf(stderr, "%s:%d: bad mixing '%s', using linear\n", path.c_str(), lineno,
-                         value.c_str());
-            return false;
-        }
-        return true;
-    }
     return true;
 }
 
@@ -102,11 +85,10 @@ inline bool save(const std::string& path, const AppSettings& s) {
     // Line-preserving update: the file also holds controller bindings, so
     // only the three known keys are rewritten in place and everything else
     // (bindings, comments, blank lines) is kept as-is.
-    const char* names[3] = {"video.fullscreen", "video.show_fps", "audio.mixing"};
-    std::string values[3] = {
+    const char* names[2] = {"video.fullscreen", "video.show_fps"};
+    std::string values[2] = {
         s.fullscreen ? "1" : "0",
         s.show_fps ? "1" : "0",
-        s.mixing == Mixing::Nonlinear ? "nonlinear" : "linear",
     };
     std::vector<std::string> lines;
     {
@@ -114,7 +96,7 @@ inline bool save(const std::string& path, const AppSettings& s) {
         std::string line;
         while (f && std::getline(f, line)) lines.push_back(line);
     }
-    bool seen[3] = {false, false, false};
+    bool seen[2] = {false, false};
     std::string out;
     for (const std::string& line : lines) {
         const std::string t = trim(line);
@@ -123,7 +105,7 @@ inline bool save(const std::string& path, const AppSettings& s) {
             const size_t eq = t.find('=');
             if (eq != std::string::npos) {
                 const std::string name = trim(t.substr(0, eq));
-                for (int i = 0; i < 3; i++) {
+                for (int i = 0; i < 2; i++) {
                     if (name == names[i]) {
                         known = true;
                         if (!seen[i]) {
@@ -145,7 +127,7 @@ inline bool save(const std::string& path, const AppSettings& s) {
     if (lines.empty()) {
         out = "# smb3pc settings. Written by the in-game menu; edit by hand if you like.\n" + out;
     }
-    for (int i = 0; i < 3; i++) {
+    for (int i = 0; i < 2; i++) {
         if (!seen[i]) {
             out += names[i];
             out += " = ";

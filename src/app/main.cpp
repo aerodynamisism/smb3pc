@@ -4,9 +4,9 @@
 //   smb3pc [--assets DIR] [--shaders DIR] [--config FILE]
 //
 // Default keys: arrows = D-pad, X = A, Z = B, Enter = Start, Right Shift = Select,
-// F11 = menu (fullscreen, FPS counter, audio mix), Esc = quit. Gamepad: South = A, East = B, Back = Select,
+// F11 = menu (fullscreen, FPS counter), Esc = quit. Gamepad: South = A, East = B, Back = Select,
 // Start = Start, D-pad = D-pad. Remap keys in settings.cfg (see README).
-// Menu settings (fullscreen, FPS counter, audio mix) persist in settings.cfg.
+// Menu settings (fullscreen, FPS counter) persist in settings.cfg.
 #include <SDL3/SDL.h>
 
 #include <algorithm>
@@ -182,7 +182,6 @@ int main(int argc, char** argv) {
         exit_code = 1;
     } else {
         m->reset();
-        m->apu.set_mixing(app_settings.mixing);
         uint8_t kb_state = 0;   // keyboard contribution to the pad byte
         uint8_t gp_state = 0;   // gamepad contribution
         bool running = true;
@@ -195,7 +194,6 @@ int main(int argc, char** argv) {
         bool chord_fired = false;
         int menu_sel = 0;
         bool show_fps = app_settings.show_fps;
-        bool nonlinear_audio = app_settings.mixing == Mixing::Nonlinear;
         // Fullscreen is tracked here, not read back from the window: on some
         // platforms (notably Wayland) the window flags update asynchronously,
         // so a read-back right after toggling can return the old state.
@@ -204,7 +202,6 @@ int main(int argc, char** argv) {
         auto save_settings = [&]() {
             app_settings.fullscreen = fullscreen;
             app_settings.show_fps = show_fps;
-            app_settings.mixing = nonlinear_audio ? Mixing::Nonlinear : Mixing::Linear;
             if (!settings::save(config, app_settings)) {
                 std::fprintf(stderr, "cannot write %s\n", config.c_str());
             }
@@ -232,10 +229,6 @@ int main(int argc, char** argv) {
                     } else if (menu_sel == 1) {
                         show_fps = !show_fps;
                         save_settings();
-                    } else if (menu_sel == 2) {
-                        nonlinear_audio = !nonlinear_audio;
-                        m->apu.set_mixing(nonlinear_audio ? Mixing::Nonlinear : Mixing::Linear);
-                        save_settings();
                     } else {
                         menu_open = false;  // unreachable, but never trap the player
                     }
@@ -247,7 +240,7 @@ int main(int argc, char** argv) {
             std::memcpy(screen.data(), src, sizeof(uint32_t) * screen.size());
             if (show_fps) draw_fps(screen.data(), fps_shown, m->chr);
             if (menu_open)
-                draw_menu(screen.data(), MenuView{menu_sel, fullscreen, show_fps, nonlinear_audio},
+                draw_menu(screen.data(), MenuView{menu_sel, fullscreen, show_fps},
                           m->chr);
             return static_cast<const uint32_t*>(screen.data());
         };
@@ -353,9 +346,9 @@ int main(int argc, char** argv) {
                 // Nudge the APU's output rate by at most 0.5%: a little fast when the device queue is
                 // low, a little slow when high. This holds the queue at its target without dropping audio.
                 const double fill = (static_cast<double>(kQueueTarget) - SDL_GetAudioStreamQueued(audio)) / kQueueTarget;
-                m->apu.set_rate_scale(1.0 + 0.005 * std::clamp(fill, -1.0, 1.0));
+                m->set_audio_rate_scale(1.0 + 0.005 * std::clamp(fill, -1.0, 1.0));
             }
-            m->apu.render(m->cyc, samples);  // also drains the APU write queue
+            m->render_audio(m->cyc, samples);  // also drains the APU write queues
             if (audio) {
                 SDL_PutAudioStreamData(audio, samples.data(), static_cast<int>(samples.size() * sizeof(int16_t)));
             }
@@ -366,7 +359,10 @@ int main(int argc, char** argv) {
                 fps_frames = 0;
                 fps_t0 = now_ns;
             }
-            if (!presenter.present(show_fps ? compose(m->framebuf) : m->framebuf)) {
+            // Compose only when the FPS counter is on; the menu path composes
+            // separately while paused.
+            const bool overlays = show_fps;
+            if (!presenter.present(overlays ? compose(m->framebuf) : m->framebuf)) {
                 exit_code = 1;
                 break;
             }

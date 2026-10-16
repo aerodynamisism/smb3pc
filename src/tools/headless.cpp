@@ -189,7 +189,7 @@ int main(int argc, char** argv) {
         }
         m->run_frame();
         samples.clear();
-        m->apu.render(m->cyc, samples);
+        m->render_audio(m->cyc, samples);
         if (!wav_out.empty()) all_samples.insert(all_samples.end(), samples.begin(), samples.end());
     }
     if (!wav_out.empty() && !write_wav(wav_out.c_str(), all_samples)) {

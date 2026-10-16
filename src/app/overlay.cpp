@@ -1,7 +1,6 @@
 #include "app/overlay.h"
 
 #include <cstdio>
-#include <cstring>
 
 namespace {
 
@@ -208,12 +207,11 @@ void draw_menu(uint32_t* fb, const MenuView& view, const uint8_t* chr) {
     constexpr int label_x = x0 + 20;
     constexpr int cursor_x = x0 + 10;
     constexpr int icon_x = x0 + 126;
-    constexpr int value_x = x0 + 30;
 
     draw_gametext(fb, x0 + (w - gametext_width("SETTINGS")) / 2, y0 + 10, "Settings", chr);
 
-    const char* labels[kMenuItems] = {"FULLSCREEN", "FPS COUNTER", "AUDIO MIX"};
-    const int ys[kMenuItems] = {y0 + 26, y0 + 40, y0 + 54};
+    const char* labels[kMenuItems] = {"FULLSCREEN", "FPS COUNTER"};
+    const int ys[kMenuItems] = {y0 + 26, y0 + 40};
     for (int i = 0; i < kMenuItems; i++) {
         draw_gametext(fb, label_x, ys[i], labels[i], chr);
     }
@@ -229,6 +227,4 @@ void draw_menu(uint32_t* fb, const MenuView& view, const uint8_t* chr) {
     } else if (view.selected == 1) {
         draw_cross(fb, icon_x, ys[1], kPeachDim);
     }
-    draw_gametext(fb, value_x, ys[2] + 14,
-                  view.nonlinear_audio ? "HARDWARE ACCURATE" : "REMASTERED", chr);
 }
