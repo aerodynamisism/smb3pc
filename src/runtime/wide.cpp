@@ -28,13 +28,20 @@
 //     frame gives to the status bar (hud_top..239) continue the playfield downward, drawn
 //     with the last playfield row's palette and banking, so the level's ground runs on
 //     beside the bar; the bar's own nametable holds the HUD, not level content.
-//   - Sprites: OAM, at their true world position. Each object owns a six-sprite region
-//     (Object_SprRAM) that the drawers write screen-relative coordinates into; the same
-//     8-bit values the frame draws are lifted to the 256-pixel page nearest the object,
-//     which recovers their place in the wider window. Pieces that are vertically hidden
-//     (Y >= 239, including the game's $F8 blanks) or whose lifted spot is nowhere near
-//     the object do not belong to it and are left out instead of being drawn somewhere
-//     invented.
+//   - Sprites: the game's own pieces, at their true world position. Each drawer writes a
+//     four-byte sprite (Y, pattern, attributes, X) per piece and skips only the Y-byte
+//     write when the piece lies outside the 256-pixel frame; the generated code reports
+//     every Y value a drawer computes, the ones it stores and the ones a culling branch
+//     throws away (see translate.py), and the OAM DMA snapshots those records together with
+//     the frame. Lifting the 8-bit values onto the 256-pixel page of the object (or the
+//     player) that computed them recovers each piece's real column. Pieces no drawer
+//     computed for that frame are simply absent, so the extra columns never show a stale
+//     sprite from an earlier user of a shared region.
+//
+// The frame itself is pasted with its overscan columns cropped (screen x 0-7 and 248-255 are
+// left to the extra-column pass), so wide mode shows the same 240 playfield columns 4:3 mode
+// does, and the status bar is pasted at the centre of the picture, so the HUD stays centred
+// even while the frame has slid toward a level boundary.
 //
 // Known differences from a hypothetical 426-pixel NES running SMB3, kept deliberately:
 //   - Objects are spawned at world S+272 (the frame's right edge), so an enemy that
@@ -43,9 +50,10 @@
 //     activation earlier, because that would change gameplay.
 //   - The 8-sprites-per-line hardware limit and the sprite-0 hit apply to the frame the
 //     game drew; the extra columns can show more sprites on a line than a real PPU would.
-//   - Sprites parked in the shared spare slots ($00-$27) are screen-space effects with no
-//     world anchor (score popups, object overflow spares) and are not repeated outside
-//     the frame.
+//   - A drawer that hides a piece some other way (skipping a run of stores that is not all
+//     Y bytes, or writing a blank) leaves no usable record, so that piece is missing from
+//     the extra columns instead of being drawn in the wrong place. Every standard enemy,
+//     item and player drawer goes through a plain Y-byte store.
 //   - Camera animation that the game scripts per frame (autoscroll pushes, pipe
 //     transitions, the level-end walk) moves the frame exactly as the NES does; the wide
 //     window follows it rather than forcing the player back to centre.
@@ -61,6 +69,7 @@
 namespace {
 
 constexpr int kFrameW = 256;
+constexpr int kOverscan = 8;   // frame columns the 4:3 presentation crops, left and right
 constexpr int kRows = 240;
 constexpr int kScreens = 15;                     // Tile_Mem holds 15 screens
 constexpr int kScreenBytes = 0x1B0;              // 16 columns x 27 rows of blocks
@@ -118,23 +127,38 @@ void Machine::wide_compose() {
     const int cam_x = mem16(*this, smb3::Horz_Scroll, smb3::Horz_Scroll_Hi);
 
     // Place the wide window around the frame: centred while it fits, stopped at the level
-    // ends (the frame slides toward the other edge). Frame left = cam - left stays inside
-    // [0, 170] by construction, so the frame is never clipped by the window.
-    bool window = level_frame && level_px >= kWideW;
+    // ends (the frame slides toward the other edge). The camera only hugs the window while it
+    // is inside the level; mid-transition (a junction reloading the level) Horz_Scroll and
+    // Level_Width briefly describe different levels, and a camera outside this level would put
+    // the frame outside the picture, so those frames keep the frame centred on black.
+    bool window = level_frame && level_px >= kWideW && cam_x >= 0 && cam_x <= level_px - kFrameW;
     int left = 0;
+    int frame_x = (kWideW - kFrameW) / 2;
     if (window) {
         left = cam_x - kWideExtra;
         left = std::min(left, level_px - kWideW);
         left = std::max(left, 0);
+        frame_x = cam_x - left;  // 0..kWideExtra: the frame always fits inside the window
     }
-    wide_frame_x = window ? cam_x - left : (kWideW - kFrameW) / 2;
-    wide_left = window ? left : 0;
+    wide_frame_x = std::clamp(frame_x, 0, kWideW - kFrameW);
+    wide_left = window ? cam_x - wide_frame_x : 0;
 
-    // The game frame itself, at full width (the 4:3 overscan crop is a presentation choice
-    // and is not applied here).
+    // The game frame, with its overscan columns cropped: screen columns 0-7 and 248-255 are
+    // left to the extra-column pass below, so wide mode shows the same 240 playfield columns
+    // 4:3 mode does. The playfield is pasted at wide_frame_x (the game's own frame position,
+    // which slides toward a level boundary); the status bar's rows are pasted at the centre of
+    // the picture so the HUD stays centred while that happens.
+    const int bar_top = hud_top;
+    const int frame_visible = kFrameW - 2 * kOverscan;
+    const bool bar = hud_layer_enabled && bar_top < kRows;
+    auto paste_x = [&](int y) -> int {
+        if (bar && y >= bar_top) return (kWideW - frame_visible) / 2;
+        return wide_frame_x + kOverscan;
+    };
     for (int y = 0; y < kRows; y++) {
-        std::memcpy(&wide_fb[static_cast<size_t>(y) * kWideW + wide_frame_x],
-                    &framebuf[static_cast<size_t>(y) * kFrameW], kFrameW * sizeof(uint32_t));
+        std::memcpy(&wide_fb[static_cast<size_t>(y) * kWideW + paste_x(y)],
+                    &framebuf[static_cast<size_t>(y) * kFrameW + kOverscan],
+                    frame_visible * sizeof(uint32_t));
     }
     if (!window || !hud_layer_enabled) return;
 
@@ -144,7 +168,6 @@ void Machine::wide_compose() {
     // sampling the bar's nametable (which holds the HUD, not level content). Level content
     // in those rows is drawn with the playfield's palette and banking, taken from the last
     // playfield row; out-of-level rows fall back to the row's backdrop.
-    const int bar_top = hud_top;
     const int play_rows = bar_top < kRows ? bar_top : kRows;
     const int base_row = play_rows > 0 ? play_rows - 1 : 0;
     const int base_world_y = world_y_of(hud_lines[base_row].v) - base_row;
@@ -192,24 +215,33 @@ void Machine::wide_compose() {
         return (((hi >> bit) & 1) << 1) | ((lo >> bit) & 1);
     };
 
-    // Background columns outside the frame.
+    // Background columns outside the pasted frame.
     for (int y = 0; y < kRows; y++) {
         const HudLine& h = row_state(y);
         const int world_y = row_world_y(y);
         const bool bg_on = h.on && (h.mask & 0x08) != 0;
+        const int px = paste_x(y);
         uint32_t* line = &wide_fb[static_cast<size_t>(y) * kWideW];
         for (int x = 0; x < kWideW; x++) {
-            if (x >= wide_frame_x && x < wide_frame_x + kFrameW) continue;  // the frame stands
+            if (x >= px && x < px + frame_visible) continue;  // the pasted frame stands
             unsigned pal2 = 0;
             const unsigned pat = bg_on ? bg_pattern(wide_left + x, world_y, h, pal2) : 0u;
             line[x] = color_of(h, pat ? pal2 * 4 + pat : 0);
         }
     }
 
-    // Collect the frame's sprite pieces, then draw the parts that fall outside it.
+    // Sprite pieces the frame is too narrow to show. spr_y_frame holds the Y byte every drawer
+    // computed for the frame in `oam` - including the pieces its visibility checks skipped,
+    // which are exactly the interesting ones - and `oam` carries that piece's pattern,
+    // attributes and X byte (those writes are never skipped). The values are screen-relative,
+    // so lifting them onto the 256-pixel page of the object (or the player) that drew them
+    // recovers the piece's real column; the lift is what turns an X byte of 20 for something
+    // 276 pixels right of the frame back into world S+276. A piece whose lifted spot is
+    // nowhere near the object it was read from belongs to another writer of this rotating
+    // region and is left out rather than drawn somewhere invented.
     const int vscroll = mem16(*this, smb3::Level_VertScroll, smb3::Level_VertScrollH);
     struct Piece {
-        int y0;         // OAM Y byte lifted to the object's page; shows at rows y0+1 .. y0+16
+        int y0;         // piece's Y byte lifted to the object's page; shows at rows y0+1 .. y0+16
         int x;          // left column
         uint8_t pattern, attr;
         unsigned slot;  // OAM slot, for priority
@@ -217,29 +249,31 @@ void Machine::wide_compose() {
     Piece pieces[kMaxPieces];
     int np = 0;
     auto place_region = [&](unsigned base, int nominal_x, int nominal_y) {
+        const unsigned nx = static_cast<unsigned>(nominal_x) & 0xFF;  // object's X byte
+        const unsigned ny = static_cast<unsigned>(nominal_y) & 0xFF;  // object's Y byte
         for (int k = 0; k < 6; k++) {
             const unsigned slot = base + 4u * static_cast<unsigned>(k);
             if (slot + 3 > 255) return;
-            const uint8_t sy = oam[slot];
-            if (sy >= 239) continue;  // vertically hidden in the frame (includes $F8 blanks)
-            const int dx = static_cast<int8_t>(oam[slot + 3] - static_cast<uint8_t>(nominal_x));
-            const int dy = static_cast<int8_t>(sy - static_cast<uint8_t>(nominal_y));
-            // The drawers write pieces within the object's own box (up to 48 wide, 64 tall);
-            // anything farther belongs to some other writer of this rotating region.
-            if (dx < -48 || dx > 48 || dy < -56 || dy > 56) continue;
-            if (np < kMaxPieces) pieces[np++] = Piece{nominal_y + dy, nominal_x + dx, oam[slot + 1], oam[slot + 2], slot};
+            const uint8_t ry = spr_y_frame[slot >> 2];
+            if (ry == kSprYNone || ry >= 239) continue;  // not computed, or below the picture
+            const int dx = static_cast<int8_t>(static_cast<uint8_t>(oam[slot + 3] - nx));
+            const int dy = static_cast<int8_t>(static_cast<uint8_t>(ry - ny));
+            // Drawers put pieces within the object's own box (up to 48 wide, 64 tall);
+            // anything farther is stale or another object's.
+            if (dx < -64 || dx > 64 || dy < -64 || dy > 64) continue;
+            if (np < kMaxPieces) {
+                pieces[np++] = Piece{nominal_y + dy, nominal_x + dx,
+                                     oam[slot + 1], oam[slot + 2], slot};
+            }
         }
     };
-    for (int s = 0; s < 8; s++) {
-        if (ram[(smb3::Objects_State + s) & 0x7FF] == 0) continue;  // dead or empty slot
-        place_region(ram[(smb3::Object_SprRAM + s) & 0x7FF] & 0xFC,
-                     mem16(*this, smb3::Objects_X + s, smb3::Objects_XHi + s) - cam_x,
-                     mem16(*this, smb3::Objects_Y + s, smb3::Objects_YHi + s) - vscroll);
+    // Owners: the objects the game had active when the frame was drawn (the player always),
+    // with the region and position they had then. The player's six sprites sit at
+    // Player_SprOff ($28), the frame's own slot order.
+    for (const SprEntity& e : spr_ents) {
+        if (!e.on) continue;  // dead or empty slot
+        place_region(e.base, static_cast<int>(e.x) - cam_x, static_cast<int>(e.y) - vscroll);
     }
-    // The player's six sprites sit at Player_SprOff ($28), the frame's own slot order.
-    place_region(ram[smb3::Player_SprOff & 0x7FF] & 0xFC,
-                 mem16(*this, smb3::Player_X, smb3::Player_XHi) - cam_x,
-                 mem16(*this, smb3::Player_Y, smb3::Player_YHi) - vscroll);
 
     // Highest slot first, so lower (higher-priority) slots win where pieces overlap. The
     // player's slots are below every object's, so its extra copies stay on top too.
@@ -270,10 +304,11 @@ void Machine::wide_compose() {
             if (lo == 0 && hi == 0) continue;
             uint32_t* line = &wide_fb[static_cast<size_t>(y) * kWideW];
             const int world_y = row_world_y(y);
+            const int px = paste_x(y);
             for (int c = 0; c < 8; c++) {
                 const int x = p.x + c + wide_frame_x;
                 if (x < 0 || x >= kWideW) continue;
-                if (x >= wide_frame_x && x < wide_frame_x + kFrameW) continue;  // the frame stands
+                if (x >= px && x < px + frame_visible) continue;  // the pasted frame stands
                 const unsigned pat = (((hi >> (7 - c)) & 1) << 1) | ((lo >> (7 - c)) & 1);
                 if (pat == 0) continue;
                 if (behind) {

@@ -952,7 +952,7 @@ class BankEmitter:
             self.out("return %s;" % hexa(addr))
 
 
-def emit_instr(be, it, data, mode, tgt):
+def emit_instr(be, it, data, mode, tgt, records=None):
     mn = it.mn
     a = it.addr
     cyc_label = "L_%04X" % a
@@ -966,7 +966,7 @@ def emit_instr(be, it, data, mode, tgt):
         return
     if mn in MACRO_BRANCH:
         real = MACRO_BRANCH[mn]
-        return emit_branch(be, real, a, tgt)
+        return emit_branch(be, real, a, tgt, records)
     if mn in MACRO_ALU:
         real = "ADC" if mn == "ADD" else "SBC"
         # The CLC/SEC prefix is one byte; emit as a single C++ sequence.
@@ -977,7 +977,7 @@ def emit_instr(be, it, data, mode, tgt):
         be.out("m.cyc += 6; m.a = (uint8_t)(~m.a); m.p &= ~0x01; m.adc(0x01);")
         return
     if mn in ("BCC", "BCS", "BEQ", "BMI", "BNE", "BPL", "BVC", "BVS"):
-        return emit_branch(be, mn, a, tgt)
+        return emit_branch(be, mn, a, tgt, records)
     emit_real(be, mn, mode, it, data, tgt)
 
 
@@ -993,7 +993,7 @@ def emit_alu_real(be, real, it):
         be.out("m.%s(%s);" % ("adc" if real == "ADC" else "sbc", read_expr(fm, value, True)))
 
 
-def emit_branch(be, mn, a, tgt):
+def emit_branch(be, mn, a, tgt, records=None):
     cond = {
         "BCC": "!(m.p & 0x01)", "BCS": "(m.p & 0x01)",
         "BEQ": "(m.p & 0x02)", "BNE": "!(m.p & 0x02)",
@@ -1004,11 +1004,69 @@ def emit_branch(be, mn, a, tgt):
     page = "((%s ^ %s) >> 8) ? 1 : 0" % ("0x%04X" % fall, hexa(tgt))
     be.out("m.cyc += 2;")
     be.out("if (%s) { m.cyc += 1 + (%s); " % (cond, page))
+    # A taken branch that skips sprite Y-byte stores is a drawer's off-screen culling: it
+    # leaves the piece out of the frame. Report the Y value it would have stored (still in A)
+    # so the widescreen pass can draw the piece in the columns the frame is not wide enough
+    # to show. The record costs no emulated cycles and does not touch the staging buffer.
+    for rec in records or ():
+        be.out("  m.spr_y_record(%s, m.a);" % rec)
     # taken branch
     if tgt in be.labels:
         be.out("  if (m.cyc >= m.evt) return %s; goto L_%04X; }" % (hexa(tgt), tgt))
     else:
         be.out("  return %s; }" % hexa(tgt))
+
+
+SPR_PAGE = 0x0200
+SPR_SLOTS = 64
+
+
+def spr_y_store_ea(it):
+    """Effective-address expression if this instruction stores a sprite Y byte, else None.
+
+    Sprite pieces are 4 bytes ($0200-$02FF, Y/pattern/attributes/X); the Y byte is the only
+    one writers skip to hide a piece. Y is the region offset the game adds, so the static
+    base's low two bits decide which byte is stored regardless of Y's runtime value."""
+    if it.kind != "instr" or it.mn != "STA" or not it.emit:
+        return None
+    data, mode, _tgt = it.emit
+    if mode not in ("abs", "absy", "absx") or len(data) < 3:
+        return None
+    val = data[1] | (data[2] << 8)
+    if not (SPR_PAGE <= val < SPR_PAGE + 4 * SPR_SLOTS) or (val & 3):
+        return None
+    return ea_expr(mode, val)
+
+
+def cull_records(items):
+    """Map branch address -> Y-store effective addresses skipped when that branch is taken.
+
+    Only runs made up entirely of sprite Y-byte stores qualify, so A still holds the Y value
+    at the branch and every skipped store would have written it."""
+    out = {}
+    by_addr = {it.addr: it for it in items if it.kind == "instr"}
+    for it in items:
+        if it.kind != "instr" or it.size != 2 or not it.mn or not it.emit:
+            continue
+        if MACRO_BRANCH.get(it.mn) is None and it.mn not in (
+                "BCC", "BCS", "BEQ", "BMI", "BNE", "BPL", "BVC", "BVS"):
+            continue
+        _data, _mode, tgt = it.emit
+        if tgt <= it.addr:
+            continue
+        run = []
+        a = it.addr + 2
+        while a < tgt:
+            ins = by_addr.get(a)
+            ea = spr_y_store_ea(ins) if ins is not None else None
+            if ea is None:
+                run = None
+                break
+            run.append(ea)
+            a += ins.size
+        if run:
+            out[it.addr] = run
+    return out
 
 
 def emit_real(be, mn, mode, it, data, tgt):
@@ -1100,6 +1158,12 @@ def emit_real(be, mn, mode, it, data, tgt):
             be.out("m.cyc += %d; { uint8_t keep = m.snd_owner; m.snd_owner = %d; m.wr(0x4015, m.%s); "
                    "m.snd_owner = keep; }" % (cy, SND_BOTH, reg))
             return
+        # Sprite Y bytes also feed the widescreen pass's record of what each drawer computed
+        # (see spr_y_store_ea); the write itself is unchanged.
+        spr_ea = spr_y_store_ea(it)
+        if spr_ea is not None:
+            be.out("m.cyc += %d; m.spr_y_store(%s, m.a);" % (cy, spr_ea))
+            return
         be.out("m.cyc += %d; m.wr(%s, m.%s);" % (cy, ea_expr(mode, val), reg))
         return
     if mn in ("AND", "ORA", "EOR"):
@@ -1141,6 +1205,7 @@ def emit_real(be, mn, mode, it, data, tgt):
 
 
 SYMS_REF = [None]
+SPR_SITES = [0, 0]  # [branches over sprite Y stores, stores they skip]
 
 
 def emit_bank(bank, origin, items):
@@ -1149,6 +1214,9 @@ def emit_bank(bank, origin, items):
         if it.kind == "instr":
             labels.add(it.addr)
     be = BankEmitter(labels)
+    culls = cull_records(items)
+    SPR_SITES[0] += len(culls)
+    SPR_SITES[1] += sum(len(v) for v in culls.values())
     cases = sorted(labels)
     lines = []
     lines.append("// Generated by tools/translate/translate.py -- do not edit.")
@@ -1166,7 +1234,7 @@ def emit_bank(bank, origin, items):
             data, mode, tgt = it.emit
             # Fresh emitter buffer per instruction, then splice
             sub = BankEmitter(labels)
-            emit_instr(sub, it, data, mode, tgt)
+            emit_instr(sub, it, data, mode, tgt, culls.get(it.addr))
             lines.extend("  " + l if not l.startswith("L_") else l for l in sub.lines)
     lines.append("  return %s;  // fall out of the bank window" % hexa(origin + 0x2000))
     lines.append("}")
@@ -1305,6 +1373,8 @@ def main():
             fh.write("  %s,\n" % name)
         fh.write("};\n")
     print("emitted %d instructions across %d banks into %s" % (total, len(table), args.out))
+    print("sprite Y records: %d culling branches record %d skipped stores"
+          % (SPR_SITES[0], SPR_SITES[1]))
 
 
 if __name__ == "__main__":

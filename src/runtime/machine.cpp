@@ -3,9 +3,11 @@
 #include <algorithm>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 
 // Generated table: g_bank_fns[bank] = bank_NN (or nullptr for data-only banks).
 #include "bank_table.inc"
+#include "smb3_syms.h"
 
 namespace {
 constexpr int kLinesPerFrame = 262;
@@ -23,6 +25,11 @@ void Machine::reset() {
     apu.reset();  // linear Blargg APU to power-on state (keeps read_cpu hook)
     sfx_apu.read_cpu = apu.read_cpu;
     sfx_apu.reset();
+    // Sprite Y records: no drawer has computed anything until the first OAM DMA snapshots the
+    // set, and an empty set is "the frame has no recorded sprites".
+    std::memset(spr_y_rec, kSprYNone, sizeof spr_y_rec);
+    std::memset(spr_y_frame, kSprYNone, sizeof spr_y_frame);
+    spr_y_seen = 0;
     // The game enables its channels once at startup, through the music voice set. Effects need the
     // same enables on their own set, or a note written before the engine's first $4015 write is silent.
     sfx_apu.write(0x4015, 0x0F, 0);
@@ -155,6 +162,7 @@ void Machine::wr_io(uint16_t addr, uint8_t val) {
     if (addr == 0x4014) {  // OAM DMA: 256 bytes from CPU page, 513/514 cycles
         uint16_t page = static_cast<uint16_t>(val << 8);
         for (int i = 0; i < 256; i++) oam[(oamaddr + i) & 0xFF] = rd(static_cast<uint16_t>(page + i));
+        oam_dma_snapshot();
         cyc += 513 + (cyc & 1);
         return;
     }
@@ -397,6 +405,33 @@ void Machine::ppu_step() {
         ppu_dot = 0;
         ppu_line = (ppu_line + 1) % kLinesPerFrame;
     }
+}
+
+void Machine::oam_dma_snapshot() {
+    // The game renders the frame from `oam`, and it fills that buffer by DMAing the sprite
+    // staging area, so freezing the Y records here makes them describe exactly the pieces of
+    // the frame the game is about to show. Values come from the sliding window of writes
+    // since the previous DMA: a drawer that skipped a piece leaves no record, and a slot
+    // nobody wrote stays "not computed" instead of showing an old piece.
+    for (int i = 0; i < 64; i++) {
+        spr_y_frame[i] = (spr_y_seen >> i & 1) ? spr_y_rec[i] : kSprYNone;
+    }
+    spr_y_seen = 0;
+    // Snapshot which entity owns which sprite region, and where it is: the game reassigns
+    // regions every frame, so the wide pass cannot read that table afterwards and still be
+    // talking about the frame in `oam`.
+    for (int s = 0; s < 8; s++) {
+        SprEntity& e = spr_ents[s];
+        e.on = rd(smb3::Objects_State + s) != 0;
+        e.base = static_cast<uint8_t>(rd(smb3::Object_SprRAM + s) & 0xFC);
+        e.x = static_cast<uint16_t>(rd(smb3::Objects_X + s) | (rd(smb3::Objects_XHi + s) << 8));
+        e.y = static_cast<uint16_t>(rd(smb3::Objects_Y + s) | (rd(smb3::Objects_YHi + s) << 8));
+    }
+    SprEntity& p = spr_ents[8];
+    p.on = 1;
+    p.base = static_cast<uint8_t>(rd(smb3::Player_SprOff) & 0xFC);
+    p.x = static_cast<uint16_t>(rd(smb3::Player_X) | (rd(smb3::Player_XHi) << 8));
+    p.y = static_cast<uint16_t>(rd(smb3::Player_Y) | (rd(smb3::Player_YHi) << 8));
 }
 
 void Machine::run_frame() {

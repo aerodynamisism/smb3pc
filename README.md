@@ -130,13 +130,24 @@ the added 85 columns on each side are composed after the frame, from game
 state only. Game logic, collision, the camera, spawning and activation are
 never touched, so with widescreen off the picture is exactly the 4:3 one.
 
+- The frame is pasted with its overscan columns cropped: screen columns 0-7
+  and 248-255 are replaced by the composed level content, so wide mode shows
+  the same 240 playfield columns a 4:3 presentation shows, plus the added
+  columns, instead of the edge columns a TV would cut off.
 - The added columns show the level columns really there: the same `Tile_Mem`
   data, layout tables, CHR banks and palettes the game streams its own
   nametable from. Block changes (hit blocks, broken blocks, bridges) appear on
   both sides as you play, and no geometry is stretched, repeated or invented.
+- Enemy and item sprites are drawn in the added columns at their real world
+  position. A drawer hides a piece outside the 256-pixel frame by skipping its
+  Y-byte store, so the generated code also reports the Y value it computed
+  (see `tools/translate/translate.py`); the wide pass lifts those pieces onto
+  the owner object's page. A drawer that hides a piece some other way leaves
+  no record and that piece is missing from the added columns.
 - Only horizontally scrolling levels are widened. The world map, title,
   ending, pipe transitions and vertical levels keep the 4:3 frame centred on
-  black.
+  black, as does a single frame in which the camera and the level data briefly
+  describe different levels while a pipe reloads it.
 - The window stops at the level's ends: the frame slides off-centre and the
   black beyond the level's last screen is never shown. The player stays
   centred while there is level on both sides and drifts toward the frame's
@@ -151,9 +162,11 @@ never touched, so with widescreen off the picture is exactly the 4:3 one.
   frame the game drew; a line in the added columns can show more sprites than
   a real PPU would. Screen-space spare sprites (score popups and the like)
   have no world position and are not repeated outside the frame.
-- The status bar spans only the frame. In the added columns the playfield
-  continues downward beside it, drawn with the playfield's own palette and
-  banking, so the ground runs on instead of the bar's HUD tiles.
+- The status bar is pasted at the centre of the picture, so the HUD stays
+  centred even at a level end, when the frame itself has slid toward the edge.
+  In the added columns the playfield continues downward beside it, drawn with
+  the playfield's own palette and banking, so the ground runs on instead of the
+  bar's HUD tiles. The bar is background-only, so no HUD sprite needs to move.
 - The last screen of a level is mostly empty backdrop in the level data itself
   (the area leading into the ending sequence). The added columns show that
   backdrop, the same black the game streams into its nametable there, rather
@@ -161,8 +174,12 @@ never touched, so with widescreen off the picture is exactly the 4:3 one.
 
 The wide columns were verified against the game's own output: at a freshly
 loaded level every streamed column's pattern and palette from the PPU's
-nametable and scrolling matches the composed ones bit for bit, and the frame
-region of every wide picture is byte-identical to the 4:3 framebuffer.
+nametable and scrolling matches the composed ones bit for bit, the frame
+region of every wide picture is byte-identical to the 4:3 framebuffer, the
+centred status bar and cropped columns match it too, and an enemy in the added
+columns renders pixel for pixel like the same enemy inside the frame. A run
+that leaves the 1-1 bonus room through its exit pipe ends in the same state
+with widescreen on and off.
 
 ### Settings
 

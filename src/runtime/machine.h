@@ -110,6 +110,40 @@ struct Machine {
     // The wide picture is the 4:3 frame with real level content added left and right.
     // Nothing here touches the game: wide_compose() runs after run_frame() and only
     // reads RAM, the captured rows and the ROM tables, so 4:3 output stays identical.
+    //
+    // Sprite Y records: the drawers hide a piece that lies outside the 256-pixel frame by
+    // skipping its Y-byte write, so the staging buffer alone cannot say where the game put a
+    // piece a wider frame would show. Generated code reports every Y value a drawer computes
+    // (see translate.py) - the stores that happen and the ones a culling branch throws away -
+    // and the OAM DMA snapshots the set into spr_y_frame, so the wide pass reads exactly the
+    // pieces belonging to the frame `oam` holds, with no freshness guessing. 0xFE marks a
+    // slot no drawer computed for that frame. Read-only side channel; never feeds the game.
+    static constexpr uint8_t kSprYNone = 0xFE;
+    uint8_t spr_y_rec[64] = {};        // Y values computed since the last OAM DMA
+    uint64_t spr_y_seen = 0;           // which slots those are
+    uint8_t spr_y_frame[64] = {};      // the set snapshotted with the frame in `oam`
+    // The sprite owner each region belongs to, snapshotted with the same frame (the object
+    // table's region assignments and positions are a frame ahead of the OAM copy once the
+    // wide pass runs, so it needs the pair as the drawers saw them). Index 0-7: objects;
+    // 8: the player.
+    struct SprEntity {
+        uint8_t on;
+        uint8_t base;   // Object_SprRAM / Player_SprOff value, low bits cleared
+        uint16_t x, y;  // world position
+    };
+    SprEntity spr_ents[9] = {};
+    inline void spr_y_record(uint16_t ea, uint8_t val) {
+        const unsigned slot = static_cast<unsigned>(ea - 0x0200) >> 2;
+        if (slot < 64) {
+            spr_y_rec[slot] = val;
+            spr_y_seen |= 1ull << slot;
+        }
+    }
+    inline void spr_y_store(uint16_t ea, uint8_t val) {
+        spr_y_record(ea, val);
+        wr(ea, val);
+    }
+    void oam_dma_snapshot();
     static constexpr int kWideW = 426;    // 256 + 2 * 85: 16:9 at NES pixel scale
     static constexpr int kWideExtra = 85;
     bool wide_enabled = false;            // user setting; see set_widescreen()
