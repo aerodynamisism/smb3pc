@@ -4,9 +4,9 @@
 //   smb3pc [--assets DIR] [--shaders DIR] [--config FILE]
 //
 // Default keys: arrows = D-pad, X = A, Z = B, Enter = Start, Right Shift = Select,
-// F11 = menu (fullscreen, FPS counter), Esc = quit. Gamepad: South = A, East = B, Back = Select,
-// Start = Start, D-pad = D-pad. Remap keys in settings.cfg (see README).
-// Menu settings (fullscreen, FPS counter) persist in settings.cfg.
+// F11 = menu (fullscreen, FPS counter, widescreen), Esc = quit. Gamepad: South = A, East = B,
+// Back = Select, Start = Start, D-pad = D-pad. Remap keys in settings.cfg (see README).
+// Menu settings (fullscreen, FPS counter, widescreen) persist in settings.cfg.
 #include <SDL3/SDL.h>
 
 #include <algorithm>
@@ -143,9 +143,14 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "SDL_Init: %s\n", SDL_GetError());
         return 1;
     }
-    // 720x720 is exactly 3x the visible 240x240 picture (overscan cropped), so the
-    // pillarboxed viewport fills the window with no black border at startup.
-    SDL_Window* window = SDL_CreateWindow("Super Mario Bros. 3", 720, 720,
+    // Both startup sizes are exact integer scales of the picture, so the
+    // pillarboxed/letterboxed viewport fills the window with no black border:
+    // 720x720 is 3x the visible 240x240 4:3 picture (overscan cropped) and
+    // 852x480 is 2x the 426x240 widescreen picture.
+    constexpr int k4x3Window = 720, kWideWindowW = 852, kWideWindowH = 480;
+    SDL_Window* window = SDL_CreateWindow("Super Mario Bros. 3",
+                                          app_settings.widescreen ? kWideWindowW : k4x3Window,
+                                          app_settings.widescreen ? kWideWindowH : k4x3Window,
                                           SDL_WINDOW_VULKAN | SDL_WINDOW_RESIZABLE);
     if (!window) {
         std::fprintf(stderr, "SDL_CreateWindow: %s\n", SDL_GetError());
@@ -194,6 +199,11 @@ int main(int argc, char** argv) {
         bool chord_fired = false;
         int menu_sel = 0;
         bool show_fps = app_settings.show_fps;
+        // Widescreen: the game frame plus the level content really to either side of
+        // it (see runtime/wide.cpp). Toggling switches the window to that picture's
+        // pixel scale, since the two pictures have different aspect ratios.
+        bool widescreen = app_settings.widescreen;
+        m->set_widescreen(widescreen);
         // Fullscreen is tracked here, not read back from the window: on some
         // platforms (notably Wayland) the window flags update asynchronously,
         // so a read-back right after toggling can return the old state.
@@ -202,6 +212,7 @@ int main(int argc, char** argv) {
         auto save_settings = [&]() {
             app_settings.fullscreen = fullscreen;
             app_settings.show_fps = show_fps;
+            app_settings.widescreen = widescreen;
             if (!settings::save(config, app_settings)) {
                 std::fprintf(stderr, "cannot write %s\n", config.c_str());
             }
@@ -209,7 +220,9 @@ int main(int argc, char** argv) {
         int fps_shown = 0;
         int fps_frames = 0;
         uint64_t fps_t0 = SDL_GetTicksNS();
-        std::vector<uint32_t> screen(256 * 240);
+        std::vector<uint32_t> screen;  // overlay-composed scratch copy of the picture
+        // Width of the picture being shown: the wide compose buffer or the NES frame.
+        auto picture_w = [&]() { return widescreen ? Machine::kWideW : 256; };
         auto menu_action = [&](MenuAction act) {
             switch (act) {
                 case MenuAction::Up:
@@ -230,18 +243,29 @@ int main(int argc, char** argv) {
                         show_fps = !show_fps;
                         save_settings();
                     } else {
-                        menu_open = false;  // unreachable, but never trap the player
+                        widescreen = !widescreen;
+                        m->set_widescreen(widescreen);
+                        // Resize to the new picture's exact integer scale unless
+                        // fullscreen, which keeps the window it has.
+                        if (!fullscreen) {
+                            SDL_SetWindowSize(window, widescreen ? kWideWindowW : k4x3Window,
+                                              widescreen ? kWideWindowH : k4x3Window);
+                            SDL_SetWindowPosition(window, SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED);
+                        }
+                        save_settings();
                     }
                     break;
             }
         };
-        // The frame to show: the NES picture with the overlays that are on.
-        auto compose = [&](const uint32_t* src) {
-            std::memcpy(screen.data(), src, sizeof(uint32_t) * screen.size());
-            if (show_fps) draw_fps(screen.data(), fps_shown, m->chr);
+        // The picture to show with the overlays that are on, into a scratch copy.
+        auto compose = [&]() {
+            screen.resize(static_cast<size_t>(picture_w()) * 240);
+            std::memcpy(screen.data(), widescreen ? m->wide_fb.data() : m->framebuf,
+                        sizeof(uint32_t) * screen.size());
+            const OverlayTarget target{screen.data(), picture_w(), 240};
+            if (show_fps) draw_fps(target, fps_shown, m->chr);
             if (menu_open)
-                draw_menu(screen.data(), MenuView{menu_sel, fullscreen, show_fps},
-                          m->chr);
+                draw_menu(target, MenuView{menu_sel, fullscreen, show_fps, widescreen}, m->chr);
             return static_cast<const uint32_t*>(screen.data());
         };
         while (running) {
@@ -330,7 +354,7 @@ int main(int argc, char** argv) {
             }
             if (menu_open) {
                 // Paused: keep showing the last frame with the menu on it.
-                if (!presenter.present(compose(m->framebuf))) {
+                if (!presenter.present(compose(), picture_w())) {
                     exit_code = 1;
                     break;
                 }
@@ -340,6 +364,7 @@ int main(int argc, char** argv) {
             m->joy[0] = static_cast<uint8_t>(kb_state | gp_state);
             // One emulated frame per presented image, so motion advances evenly.
             m->run_frame();
+            if (widescreen) m->wide_compose();
             fps_frames++;
             samples.clear();
             if (audio) {
@@ -362,7 +387,8 @@ int main(int argc, char** argv) {
             // Compose only when the FPS counter is on; the menu path composes
             // separately while paused.
             const bool overlays = show_fps;
-            if (!presenter.present(overlays ? compose(m->framebuf) : m->framebuf)) {
+            const uint32_t* pic = widescreen ? m->wide_fb.data() : m->framebuf;
+            if (!presenter.present(overlays ? compose() : pic, picture_w())) {
                 exit_code = 1;
                 break;
             }

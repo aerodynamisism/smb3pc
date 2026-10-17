@@ -52,13 +52,14 @@ foreach(n RANGE 0 31)
     list(APPEND GENERATED_BANKS "${GEN_DIR}/bank_${id}.cpp")
 endforeach()
 add_custom_command(
-    OUTPUT ${GENERATED_BANKS} "${GEN_DIR}/bank_table.inc"
+    OUTPUT ${GENERATED_BANKS} "${GEN_DIR}/bank_table.inc" "${GEN_DIR}/smb3_syms.h"
     COMMAND ${Python3_EXECUTABLE} "${CMAKE_SOURCE_DIR}/tools/translate/translate.py"
             --src "${SMB3_SRC}" --rom "${SMB3_ROM}" --out "${GEN_DIR}"
     DEPENDS ${TRANSLATOR_INPUTS} "${SMB3_SRC}"
     COMMENT "Translating 6502 disassembly to C++ (verifying against ROM)"
     VERBATIM)
-add_custom_target(smb3_translate DEPENDS ${GENERATED_BANKS} "${GEN_DIR}/bank_table.inc")
+add_custom_target(smb3_translate DEPENDS ${GENERATED_BANKS} "${GEN_DIR}/bank_table.inc"
+                  "${GEN_DIR}/smb3_syms.h")
 
 # 3) Runtime core and generated code.
 # Blargg APU (Nes_Snd_Emu 0.1.7, linear mixing only, in src/runtime/apu.cpp).
@@ -66,6 +67,7 @@ add_custom_target(smb3_translate DEPENDS ${GENERATED_BANKS} "${GEN_DIR}/bank_tab
 add_library(smb3_core STATIC
     src/runtime/machine.cpp
     src/runtime/ppu.cpp
+    src/runtime/wide.cpp
     src/runtime/apu.cpp
     src/runtime/nes_apu/Blip_Buffer.cpp
     src/runtime/nes_apu/Nes_Apu.cpp

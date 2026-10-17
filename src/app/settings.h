@@ -3,6 +3,7 @@
 // Keys (all optional, one per line, '#' starts a comment):
 //   video.fullscreen = 0|1
 //   video.show_fps   = 0|1
+//   video.widescreen = 0|1
 //
 // A missing file keeps the defaults. A bad value warns on stderr and keeps
 // that key's default; unknown keys are ignored so newer files stay readable.
@@ -19,6 +20,7 @@
 struct AppSettings {
     bool fullscreen = false;
     bool show_fps = false;
+    bool widescreen = false;
 };
 
 namespace settings {
@@ -39,7 +41,7 @@ inline std::string trim(const std::string& s) {
 // bad value; unknown keys are silently ignored.
 inline bool apply_line(const std::string& path, int lineno, const std::string& name,
                        const std::string& value, AppSettings& s) {
-    if (name == "video.fullscreen" || name == "video.show_fps") {
+    if (name == "video.fullscreen" || name == "video.show_fps" || name == "video.widescreen") {
         const std::string v = lower(value);
         bool b = false;
         if (v == "1" || v == "true" || v == "on" || v == "yes") {
@@ -53,8 +55,10 @@ inline bool apply_line(const std::string& path, int lineno, const std::string& n
         }
         if (name == "video.fullscreen") {
             s.fullscreen = b;
-        } else {
+        } else if (name == "video.show_fps") {
             s.show_fps = b;
+        } else {
+            s.widescreen = b;
         }
         return true;
     }
@@ -83,12 +87,13 @@ inline bool load(const std::string& path, AppSettings& s) {
 
 inline bool save(const std::string& path, const AppSettings& s) {
     // Line-preserving update: the file also holds controller bindings, so
-    // only the two known keys are rewritten in place and everything else
+    // only the known keys are rewritten in place and everything else
     // (bindings, comments, blank lines) is kept as-is.
-    const char* names[2] = {"video.fullscreen", "video.show_fps"};
-    std::string values[2] = {
+    const char* names[3] = {"video.fullscreen", "video.show_fps", "video.widescreen"};
+    std::string values[3] = {
         s.fullscreen ? "1" : "0",
         s.show_fps ? "1" : "0",
+        s.widescreen ? "1" : "0",
     };
     std::vector<std::string> lines;
     {
@@ -96,7 +101,7 @@ inline bool save(const std::string& path, const AppSettings& s) {
         std::string line;
         while (f && std::getline(f, line)) lines.push_back(line);
     }
-    bool seen[2] = {false, false};
+    bool seen[3] = {false, false, false};
     std::string out;
     for (const std::string& line : lines) {
         const std::string t = trim(line);
@@ -105,7 +110,7 @@ inline bool save(const std::string& path, const AppSettings& s) {
             const size_t eq = t.find('=');
             if (eq != std::string::npos) {
                 const std::string name = trim(t.substr(0, eq));
-                for (int i = 0; i < 2; i++) {
+                for (int i = 0; i < 3; i++) {
                     if (name == names[i]) {
                         known = true;
                         if (!seen[i]) {
@@ -127,7 +132,7 @@ inline bool save(const std::string& path, const AppSettings& s) {
     if (lines.empty()) {
         out = "# smb3pc settings. Written by the in-game menu; edit by hand if you like.\n" + out;
     }
-    for (int i = 0; i < 2; i++) {
+    for (int i = 0; i < 3; i++) {
         if (!seen[i]) {
             out += names[i];
             out += " = ";

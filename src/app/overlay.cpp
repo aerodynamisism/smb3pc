@@ -4,9 +4,6 @@
 
 namespace {
 
-constexpr int kW = 256;
-constexpr int kH = 240;
-
 // Menu colours: NES $0F black panel fill, $36 peach ink (#F0D0B0) for the
 // map-border look.
 // Colours in the framebuffer layout: R in the lowest byte, opaque alpha in the highest.
@@ -19,13 +16,13 @@ constexpr uint32_t kPeach = rgb(0xF0, 0xD0, 0xB0);  // NES $36, panel fill
 constexpr uint32_t kPeachDim = rgb(0x78, 0x68, 0x58);  // selected-but-off markers
 constexpr uint32_t kPaper = rgb(0xFC, 0xFC, 0xFC);  // NES $30, border trim
 
-void put(uint32_t* fb, int x, int y, uint32_t color) {
-    if (x >= 0 && x < kW && y >= 0 && y < kH) fb[y * kW + x] = color;
+void put(OverlayTarget t, int x, int y, uint32_t color) {
+    if (x >= 0 && x < t.w && y >= 0 && y < t.h) t.fb[y * t.w + x] = color;
 }
 
-void fill_rect(uint32_t* fb, int x, int y, int w, int h, uint32_t color) {
+void fill_rect(OverlayTarget t, int x, int y, int w, int h, uint32_t color) {
     for (int yy = y; yy < y + h; yy++) {
-        for (int xx = x; xx < x + w; xx++) put(fb, xx, yy, color);
+        for (int xx = x; xx < x + w; xx++) put(t, xx, yy, color);
     }
 }
 
@@ -70,9 +67,9 @@ bool font_tile(char c, FontTile& t) {
 // border so no tan shows outside its white lines. Text uses the outline form
 // (values 0/2), which keeps digits readable; the border uses the solid form
 // (any nonzero value).
-void draw_tile(uint32_t* fb, int x, int y, const uint8_t* chr, FontTile t, uint32_t color,
+void draw_tile(OverlayTarget t, int x, int y, const uint8_t* chr, FontTile ft, uint32_t color,
                bool solid, bool flip = false, bool opaque = false) {
-    const uint8_t* g = chr + static_cast<size_t>(t.bank) * 1024 + static_cast<size_t>(t.tile) * 16;
+    const uint8_t* g = chr + static_cast<size_t>(ft.bank) * 1024 + static_cast<size_t>(ft.tile) * 16;
     for (int row = 0; row < 8; row++) {
         const uint8_t lo = g[row];
         const uint8_t hi = g[row + 8];
@@ -80,10 +77,10 @@ void draw_tile(uint32_t* fb, int x, int y, const uint8_t* chr, FontTile t, uint3
             const int sc = flip ? col : 7 - col;
             const unsigned v = (((hi >> sc) & 1) << 1) | ((lo >> sc) & 1);
             if (v == 3 || (!solid && v == 1)) {
-                if (opaque) put(fb, x + col, y + row, kBlack);
+                if (opaque) put(t, x + col, y + row, kBlack);
                 continue;
             }
-            put(fb, x + col, y + row, color);
+            put(t, x + col, y + row, color);
         }
     }
 }
@@ -91,17 +88,17 @@ void draw_tile(uint32_t* fb, int x, int y, const uint8_t* chr, FontTile t, uint3
 
 constexpr int kAdvance = 9;  // 8px glyphs plus 1px so stroked neighbours never touch
 
-void draw_gametext(uint32_t* fb, int x, int y, const char* text, const uint8_t* chr) {
+void draw_gametext(OverlayTarget t, int x, int y, const char* text, const uint8_t* chr) {
     // Two passes for the HUD look: white cores with a 1px black rim, the
     // same stroke weight as the in-game HUD glyphs.
     for (int pass = 0; pass < 2; pass++) {
         int gx = x;
         for (const char* c = text; *c != '\0'; c++, gx += kAdvance) {
-            FontTile t{0, 0};
-            if (!font_tile(*c, t)) continue;
+            FontTile ft{0, 0};
+            if (!font_tile(*c, ft)) continue;
             if (pass == 0) {
                 const uint8_t* g =
-                    chr + static_cast<size_t>(t.bank) * 1024 + static_cast<size_t>(t.tile) * 16;
+                    chr + static_cast<size_t>(ft.bank) * 1024 + static_cast<size_t>(ft.tile) * 16;
                 for (int row = 0; row < 8; row++) {
                     const uint8_t lo = g[row];
                     const uint8_t hi = g[row + 8];
@@ -110,12 +107,12 @@ void draw_gametext(uint32_t* fb, int x, int y, const char* text, const uint8_t* 
                         if (v == 3 || v == 1) continue;
                         for (int dy = -1; dy <= 1; dy++) {
                             for (int dx = -1; dx <= 1; dx++)
-                                put(fb, gx + col + dx, y + row + dy, kBlack);
+                                put(t, gx + col + dx, y + row + dy, kBlack);
                         }
                     }
                 }
             } else {
-                draw_tile(fb, gx, y, chr, t, kPaper, false);
+                draw_tile(t, gx, y, chr, ft, kPaper, false);
             }
         }
     }
@@ -127,71 +124,75 @@ int gametext_width(const char* text) {
     return n * kAdvance;
 }
 
-void put_mark(uint32_t* fb, int x, int y, uint32_t color) {
-    put(fb, x, y, color);
-    put(fb, x + 1, y, color);
+void put_mark(OverlayTarget t, int x, int y, uint32_t color) {
+    put(t, x, y, color);
+    put(t, x + 1, y, color);
 }
 
 // Check mark in an 8x8 cell: short arm down-right, long arm up-right.
-void draw_check(uint32_t* fb, int x, int y, uint32_t color) {
+void draw_check(OverlayTarget t, int x, int y, uint32_t color) {
     for (int i = 0; i < 3; i++) {
-        put_mark(fb, x + 1 + i, y + 4 + i, color);
+        put_mark(t, x + 1 + i, y + 4 + i, color);
     }
     for (int i = 0; i < 4; i++) {
-        put_mark(fb, x + 3 + i, y + 6 - i, color);
+        put_mark(t, x + 3 + i, y + 6 - i, color);
     }
 }
 
 // Cross mark in an 8x8 cell: two diagonals.
-void draw_cross(uint32_t* fb, int x, int y, uint32_t color) {
+void draw_cross(OverlayTarget t, int x, int y, uint32_t color) {
     for (int i = 0; i < 6; i++) {
-        put_mark(fb, x + 1 + i, y + 1 + i, color);
-        put_mark(fb, x + 5 - i, y + 1 + i, color);
+        put_mark(t, x + 1 + i, y + 1 + i, color);
+        put_mark(t, x + 5 - i, y + 1 + i, color);
     }
 }
 
 // Cursor: filled right-pointing triangle with a 1px black rim. (The two
 // arrow-like tiles at (5F,2E)/(5F,2F) are halves of one 16px map object, so
 // neither works alone in the 8px cursor cell.)
-void draw_cursor(uint32_t* fb, int x, int y) {
+void draw_cursor(OverlayTarget t, int x, int y) {
     for (int row = 0; row < 8; row++) {
         const int half = row < 4 ? row : 7 - row;
         for (int col = 0; col <= half + 1; col++) {
             for (int dy = -1; dy <= 1; dy++) {
-                for (int dx = -1; dx <= 1; dx++) put(fb, x + col + dx, y + row + dy, kBlack);
+                for (int dx = -1; dx <= 1; dx++) put(t, x + col + dx, y + row + dy, kBlack);
             }
         }
     }
     for (int row = 0; row < 8; row++) {
         const int half = row < 4 ? row : 7 - row;
         for (int col = 0; col <= half + 1; col++) {
-            put(fb, x + col, y + row, kSelect);
+            put(t, x + col, y + row, kSelect);
         }
     }
 }
 
 }  // namespace
 
-void draw_fps(uint32_t* fb, int fps, const uint8_t* chr) {
+void draw_fps(OverlayTarget t, int fps, const uint8_t* chr) {
     char text[16];
     std::snprintf(text, sizeof text, "FPS %d", fps);
-    // Inside the 8-pixel overscan crop, so it stays visible. No backing box:
-    // the stroked glyphs stay readable over gameplay on their own.
-    draw_gametext(fb, 12, 11, text, chr);
+    // In the picture's top-left corner: inside the 4:3 overscan crop, and on the
+    // added left columns in widescreen. No backing box: the stroked glyphs stay
+    // readable over gameplay on their own.
+    draw_gametext(t, 12, 11, text, chr);
 }
 
-void draw_menu(uint32_t* fb, const MenuView& view, const uint8_t* chr) {
+void draw_menu(OverlayTarget t, const MenuView& view, const uint8_t* chr) {
     // Tile-aligned black panel framed with the world-map status strip border
     // (CHR bank $5E on the $0000 page). The right-side corner tiles read as
     // proper corners, so the left side mirrors them with a horizontal flip.
-    constexpr int x0 = 32, y0 = 56, w = 192, h = 88;
+    // Centred in the picture, so it lands in the middle of the NES frame in
+    // 4:3 and of the wide window in widescreen.
+    constexpr int w = 192, h = 88;
+    const int x0 = (t.w - w) / 2, y0 = 56;
     constexpr FontTile kTop{0x5E, 0x21}, kBottom{0x5E, 0x24};
     constexpr FontTile kLeft{0x5E, 0x26}, kRight{0x5E, 0x27};
     constexpr FontTile kTopCorner{0x5E, 0x22}, kBottomCorner{0x5E, 0x25};
-    auto edge = [&](int x, int y, FontTile t) { draw_tile(fb, x, y, chr, t, kPaper, false, false, true); };
+    auto edge = [&](int x, int y, FontTile ft) { draw_tile(t, x, y, chr, ft, kPaper, false, false, true); };
     // Full-box black backing first: border tiles leave transparent pixels that
     // must fall back to black, never the game frame behind the menu.
-    fill_rect(fb, x0, y0, w, h, kPeach);
+    fill_rect(t, x0, y0, w, h, kPeach);
     for (int x = x0 + 8; x < x0 + w - 8; x += 8) {
         edge(x, y0, kTop);
         edge(x, y0 + h - 8, kBottom);
@@ -200,31 +201,29 @@ void draw_menu(uint32_t* fb, const MenuView& view, const uint8_t* chr) {
         edge(x0, y, kLeft);
         edge(x0 + w - 8, y, kRight);
     }
-    draw_tile(fb, x0, y0, chr, kTopCorner, kPaper, false, true, true);
-    draw_tile(fb, x0 + w - 8, y0, chr, kTopCorner, kPaper, false, false, true);
-    draw_tile(fb, x0, y0 + h - 8, chr, kBottomCorner, kPaper, false, true, true);
-    draw_tile(fb, x0 + w - 8, y0 + h - 8, chr, kBottomCorner, kPaper, false, false, true);
-    constexpr int label_x = x0 + 20;
-    constexpr int cursor_x = x0 + 10;
-    constexpr int icon_x = x0 + 126;
+    draw_tile(t, x0, y0, chr, kTopCorner, kPaper, false, true, true);
+    draw_tile(t, x0 + w - 8, y0, chr, kTopCorner, kPaper, false, false, true);
+    draw_tile(t, x0, y0 + h - 8, chr, kBottomCorner, kPaper, false, true, true);
+    draw_tile(t, x0 + w - 8, y0 + h - 8, chr, kBottomCorner, kPaper, false, false, true);
+    constexpr int label_x = 20;
+    constexpr int cursor_x = 10;
+    constexpr int icon_x = 126;
 
-    draw_gametext(fb, x0 + (w - gametext_width("SETTINGS")) / 2, y0 + 10, "Settings", chr);
+    draw_gametext(t, x0 + (w - gametext_width("SETTINGS")) / 2, y0 + 10, "Settings", chr);
 
-    const char* labels[kMenuItems] = {"FULLSCREEN", "FPS COUNTER"};
-    const int ys[kMenuItems] = {y0 + 26, y0 + 40};
+    const char* labels[kMenuItems] = {"FULLSCREEN", "FPS COUNTER", "WIDESCREEN"};
+    const int ys[kMenuItems] = {y0 + 26, y0 + 40, y0 + 54};
     for (int i = 0; i < kMenuItems; i++) {
-        draw_gametext(fb, label_x, ys[i], labels[i], chr);
+        draw_gametext(t, x0 + label_x, ys[i], labels[i], chr);
     }
-    draw_cursor(fb, cursor_x, ys[view.selected] - 1);
+    draw_cursor(t, x0 + cursor_x, ys[view.selected] - 1);
     // Check when on, cross when selected-but-off so state stays distinguishable.
-    if (view.fullscreen) {
-        draw_check(fb, icon_x, ys[0], kBlack);
-    } else if (view.selected == 0) {
-        draw_cross(fb, icon_x, ys[0], kPeachDim);
-    }
-    if (view.show_fps) {
-        draw_check(fb, icon_x, ys[1], kBlack);
-    } else if (view.selected == 1) {
-        draw_cross(fb, icon_x, ys[1], kPeachDim);
+    const bool on[kMenuItems] = {view.fullscreen, view.show_fps, view.widescreen};
+    for (int i = 0; i < kMenuItems; i++) {
+        if (on[i]) {
+            draw_check(t, x0 + icon_x, ys[i], kBlack);
+        } else if (view.selected == i) {
+            draw_cross(t, x0 + icon_x, ys[i], kPeachDim);
+        }
     }
 }

@@ -1,6 +1,8 @@
-// Vulkan presenter: uploads each 256x240 RGBA frame to a texture and draws it
-// to the swapchain with a nearest-filtered fullscreen triangle, fitted to
-// keep square pixels and pillarboxed/letterboxed (no cropping).
+// Vulkan presenter: uploads each 426x240 RGBA frame (the 4:3 picture occupies
+// its first 256 columns) to a texture and draws it to the swapchain with a
+// nearest-filtered fullscreen triangle, fitted to keep square pixels and
+// pillarboxed/letterboxed (no cropping). The 4:3 and 16:9 views sample
+// different source rectangles of the same texture.
 #pragma once
 
 #include <cstdint>
@@ -20,9 +22,11 @@ public:
 
     // shader_dir holds the compiled present.vert.spv / present.frag.spv.
     bool init(SDL_Window* window, const std::string& shader_dir);
-    // rgba: 256 * 240 pixels, R in the lowest byte of each word.
+    // rgba: src_w * 240 pixels, R in the lowest byte of each word. src_w is
+    // 256 (4:3: the frame plus its overscan, shown cropped to 240 columns) or
+    // 426 (16:9: the wide compose buffer, shown whole).
     // Returns false on an unrecoverable Vulkan error.
-    bool present(const uint32_t* rgba);
+    bool present(const uint32_t* rgba, int src_w);
     void shutdown();
 
 private:

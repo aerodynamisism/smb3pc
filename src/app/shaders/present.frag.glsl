@@ -4,8 +4,14 @@ layout(location = 0) in vec2 uv;
 layout(location = 0) out vec4 outColor;
 layout(set = 0, binding = 0) uniform sampler2D frame;
 
+// Source rectangle of the picture inside the frame texture, in texture pixels:
+// the whole 426x240 widescreen picture, or the 256x240 frame's 240 visible
+// columns (8 pixels of overscan are hidden on each side).
+layout(push_constant) uniform PresentRect {
+    vec4 rect;  // x, y, width, height
+} pc;
+
 void main() {
-    // Overscan: the 256-pixel frame shows columns 8..247 only (240 pixels across the viewport).
-    vec2 src = vec2((8.0 + uv.x * 240.0) / 256.0, uv.y);
+    vec2 src = (pc.rect.xy + uv * pc.rect.zw) / vec2(textureSize(frame, 0));
     outColor = vec4(texture(frame, src).rgb, 1.0);
 }

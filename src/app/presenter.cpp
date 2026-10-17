@@ -11,11 +11,20 @@
 
 namespace {
 
-constexpr uint32_t kFrameW = 256;
+// The picture texture is wide enough for 16:9; the 4:3 frame fills its first
+// 256 columns and the presentation samples just those.
+constexpr uint32_t kFrameW = 426;
 constexpr uint32_t kFrameH = 240;
-// Overscan: 8 pixels are hidden on each side, so the picture shown is 240 pixels wide.
+constexpr uint32_t kFrame4x3W = 256;  // 4:3 source width in the texture
+// Overscan: 8 pixels are hidden on each side, so the 4:3 picture shown is 240 pixels wide.
 constexpr uint32_t kVisibleW = 240;
 constexpr VkDeviceSize kFrameBytes = kFrameW * kFrameH * 4;
+
+// Source rectangle of the presentation, in texture pixels. Pushed to the
+// fragment shader, which maps the fullscreen triangle's 0..1 UV onto it.
+struct PresentRect {
+    float x, y, w, h;
+};
 
 bool ok(VkResult r, const char* what) {
     if (r == VK_SUCCESS) return true;
@@ -231,6 +240,12 @@ bool Presenter::create_static_objects() {
     VkPipelineLayoutCreateInfo pl{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
     pl.setLayoutCount = 1;
     pl.pSetLayouts = &dset_layout_;
+    VkPushConstantRange pcr{};
+    pcr.stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
+    pcr.offset = 0;
+    pcr.size = sizeof(PresentRect);
+    pl.pushConstantRangeCount = 1;
+    pl.pPushConstantRanges = &pcr;
     return ok(vkCreatePipelineLayout(dev_, &pl, nullptr, &pipe_layout_), "vkCreatePipelineLayout");
 }
 
@@ -434,7 +449,7 @@ void Presenter::recreate_swapchain() {
 
 // ---------------------------------------------------------------- frame
 
-bool Presenter::present(const uint32_t* rgba) {
+bool Presenter::present(const uint32_t* rgba, int src_w) {
     int win_w = 0, win_h = 0;
     SDL_GetWindowSizeInPixels(window_, &win_w, &win_h);
     if (win_w <= 0 || win_h <= 0) return true;  // minimized: nothing to show
@@ -446,9 +461,19 @@ bool Presenter::present(const uint32_t* rgba) {
         if (!swapchain_) return false;
     }
 
+    const bool wide = src_w == static_cast<int>(kFrameW);
     // Previous frame's work must finish before the staging buffer is reused.
     if (!ok(vkWaitForFences(dev_, 1, &fence_, VK_TRUE, UINT64_MAX), "vkWaitForFences")) return false;
-    std::memcpy(stage_map_, rgba, kFrameBytes);
+    if (wide) {
+        std::memcpy(stage_map_, rgba, kFrameBytes);
+    } else {
+        // The 4:3 picture fills the first src_w columns; the rest of the texture is unused.
+        auto* dst = static_cast<uint8_t*>(stage_map_);
+        for (uint32_t y = 0; y < kFrameH; y++) {
+            std::memcpy(dst + y * kFrameW * 4u, rgba + static_cast<size_t>(y) * src_w,
+                        static_cast<size_t>(src_w) * 4u);
+        }
+    }
 
     uint32_t idx = 0;
     VkResult acq = vkAcquireNextImageKHR(dev_, swapchain_, UINT64_MAX, image_avail_, VK_NULL_HANDLE, &idx);
@@ -494,11 +519,19 @@ bool Presenter::present(const uint32_t* rgba) {
     // the unused area instead of cropping the picture.
     const float sw = static_cast<float>(swap_extent_.width);
     const float sh = static_cast<float>(swap_extent_.height);
-    const float scale = std::min(sw / kVisibleW, sh / kFrameH);
-    const float vw = kVisibleW * scale;
+    const float disp_w = wide ? static_cast<float>(kFrameW) : static_cast<float>(kVisibleW);
+    const float scale = std::min(sw / disp_w, sh / kFrameH);
+    const float vw = disp_w * scale;
     const float vh = kFrameH * scale;
     VkViewport viewport{(sw - vw) * 0.5f, (sh - vh) * 0.5f, vw, vh, 0.0f, 1.0f};
     VkRect2D scissor{{0, 0}, swap_extent_};
+
+    // Source rectangle of the texture this view shows: the whole wide picture,
+    // or the 4:3 frame cropped to its 240 visible columns (8 pixels of
+    // overscan hidden on each side).
+    const PresentRect rect =
+        wide ? PresentRect{0.0f, 0.0f, static_cast<float>(kFrameW), static_cast<float>(kFrameH)}
+             : PresentRect{8.0f, 0.0f, static_cast<float>(kVisibleW), static_cast<float>(kFrameH)};
 
     VkClearValue clear{};
     clear.color = {{0.0f, 0.0f, 0.0f, 1.0f}};
@@ -511,6 +544,7 @@ bool Presenter::present(const uint32_t* rgba) {
     vkCmdBeginRenderPass(cmd_, &rbi, VK_SUBPASS_CONTENTS_INLINE);
     vkCmdBindPipeline(cmd_, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline_);
     vkCmdBindDescriptorSets(cmd_, VK_PIPELINE_BIND_POINT_GRAPHICS, pipe_layout_, 0, 1, &dset_, 0, nullptr);
+    vkCmdPushConstants(cmd_, pipe_layout_, VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(rect), &rect);
     vkCmdSetViewport(cmd_, 0, 1, &viewport);
     vkCmdSetScissor(cmd_, 0, 1, &scissor);
     vkCmdDraw(cmd_, 3, 1, 0, 0);

@@ -106,6 +106,19 @@ struct Machine {
     void hud_capture(int line);
     void hud_compose();
 
+    // ---- widescreen output ----
+    // The wide picture is the 4:3 frame with real level content added left and right.
+    // Nothing here touches the game: wide_compose() runs after run_frame() and only
+    // reads RAM, the captured rows and the ROM tables, so 4:3 output stays identical.
+    static constexpr int kWideW = 426;    // 256 + 2 * 85: 16:9 at NES pixel scale
+    static constexpr int kWideExtra = 85;
+    bool wide_enabled = false;            // user setting; see set_widescreen()
+    std::vector<uint32_t> wide_fb;        // kWideW * 240 RGBA, R in the low byte
+    int wide_frame_x = kWideExtra;        // x of the game frame's left column in wide_fb
+    int wide_left = 0;                    // world X at wide_fb column 0 (in-level frames)
+    void set_widescreen(bool on);
+    void wide_compose();                  // call right after run_frame() while wide_enabled
+
     // ---- input ----
     uint8_t joy[2] = {0, 0};        // A B Select Start Up Down Left Right (bit 0 = A)
     uint8_t joy_shift[2] = {0, 0};
