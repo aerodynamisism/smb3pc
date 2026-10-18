@@ -25,6 +25,11 @@ public:
     Apu& operator=(const Apu&) = delete;
 
     void reset();
+    // Mid-run reset: silence every oscillator now, discard queued writes and any buffered
+    // samples, and rebase frame timing to now_cyc so the next render() continues cleanly
+    // from there. Unlike reset() it keeps clock rate, sample rate, volume and the DMC
+    // reader; call between renders (never from inside one).
+    void reset_silence(int64_t now_cyc);
     void write(uint16_t addr, uint8_t val, int64_t cyc);
     // Cycle-stamped like write(): runs the APU forward to cyc before reading.
     uint8_t read_status(int64_t cyc);

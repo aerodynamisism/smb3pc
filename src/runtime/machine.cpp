@@ -210,6 +210,19 @@ void Machine::set_audio_rate_scale(double scale) {
     sfx_apu.set_rate_scale(scale);
 }
 
+void Machine::reset_sfx_apu() {
+    // A level load must not carry sound across: with two voice sets, anything the sfx set
+    // still held from the previous level (a channel the map engine left ringing, an
+    // unfinished envelope, a looping DMC sample) has no music code rewriting its registers
+    // here - the per-frame music writes all land on the music set - so it would keep
+    // sounding in the new level as a background noise. Bring the set to power-on silence.
+    sfx_apu.reset_silence(cyc);
+    // The engine enables its channels once at startup (see reset()) and then relies on the
+    // enables from the boot path; a note written before the engine's next $4015 write
+    // reaches this set would otherwise be silent. Same constant as there.
+    sfx_apu.write(0x4015, 0x0F, cyc);
+}
+
 // ---------------------------------------------------------------- MMC3
 
 void Machine::wr_mapper(uint16_t addr, uint8_t val) {

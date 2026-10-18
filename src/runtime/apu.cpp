@@ -59,6 +59,18 @@ void Apu::reset() {
     d.buf.clear();
 }
 
+void Apu::reset_silence(int64_t now_cyc) {
+    Impl& d = *impl_;
+    d.pending.clear();          // queued writes belong to the state being thrown away
+    d.apu.output(&d.buf);       // re-select the shared linear buffer (mirrors reset())
+    d.apu.volume(1.0);
+    d.apu.reset(false, 0);      // power-on: every oscillator silent, zeroed, lengths/envelopes/DMC cleared
+    d.apu.dmc_reader(&dmc_reader_tramp, this);
+    d.frame_start = now_cyc;    // rebase frame timing; the next render() spans only from here
+    d.rendered_until = now_cyc;
+    d.buf.clear();
+}
+
 void Apu::write(uint16_t addr, uint8_t val, int64_t cyc) {
     impl_->pending.push_back(Impl::PendingWrite{cyc, addr, val});
 }

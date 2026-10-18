@@ -37,6 +37,12 @@ with Vulkan video and SDL3 audio.
   `Machine::sfx_apu`) summed at full level at the output, so an effect never silences or retunes
   a music channel. The sum is clamped to 16-bit range only. Generated code routes each APU write by owner (translate.py,
   `SND_ROUTINE_OWNER`).
+- At every level load the sound-effect voice set is reset to power-on state
+  (`Machine::reset_sfx_apu`, called from the first instruction of
+  `Level_Initialize`'s real init body, `PRG008_A242` — see `LEVEL_INIT_BODY_ADDR`
+  in translate.py). The sound engine re-arms only the music voices on a load, so
+  without this a channel left ringing, mid-envelope or mid-DMC-sample by the
+  previous level keeps playing on under the new level's music.
 - Deliberate deviation from the ROM: the four music gates that skipped music notes
   while a sound effect was on the same channel are removed (`GATE_TARGETS` in
   translate.py). The translator reports them and checks each one.

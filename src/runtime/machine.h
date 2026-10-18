@@ -169,6 +169,12 @@ struct Machine {
     Apu sfx_apu;                 // sound-effect voices
     void render_audio(int64_t until_cyc, std::vector<int16_t>& out);  // both voice sets, summed
     void set_audio_rate_scale(double scale);
+    // Level loads re-initialise only the music voice set (the game's own code drives
+    // Sound_PlayMusic on the music owner), so channel state left behind by the previous
+    // level used to keep sounding under the new one. Called by generated code at the
+    // first instruction of Level_Initialize's init body (see translate.py); nothing to
+    // route here, it is a sink reset.
+    void reset_sfx_apu();
 
     // ---- lifecycle ----
     void reset();

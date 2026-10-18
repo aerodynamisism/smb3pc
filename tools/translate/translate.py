@@ -864,6 +864,18 @@ SND_ROUTINE_OWNER = {
 }
 # Filled in main() from the resolved symbols.
 SND_OWNER_BY_ADDR = {}
+# Every level load funnels through Level_Initialize (one JSR site, bank 08, prg008.asm:293).
+# The routine runs every frame while a level is active ("initialize level if needed") and
+# returns early once Player_StartX is set; the real (re)initialisation body begins at its
+# PRG008_A242 label. Hooking the body (not the JSR) fires once per genuine level load rather
+# than once per frame, and it also covers re-entries that arrive after the routine's own
+# early-out. There the game re-initialises only the music voices, so the sfx set would
+# otherwise carry channel state from the previous level into the new one (a ringing channel,
+# an unfinished envelope, a looping DMC sample) with nothing rewriting its registers under
+# the new level's music. The callers still get nothing: the reset lives at Machine::
+# reset_sfx_apu, invoked from the body's first instruction.
+LEVEL_INIT_BODY_ADDR = None    # first instruction of the init body (PRG008_A242)
+LEVEL_INIT_BODY_FILE = None    # source file leaf owning that instruction
 # [start, end) of the pause routine. Its $4015 writes reach both voice sets, as the
 # original pause silenced every channel.
 SND_PAUSE_RANGE = [0, 0]
@@ -1154,6 +1166,16 @@ def emit_real(be, mn, mode, it, data, tgt):
         return
     if mn in ("STA", "STX", "STY"):
         reg = {"STA": "a", "STX": "x", "STY": "y"}[mn]
+        if (it.addr == LEVEL_INIT_BODY_ADDR
+                and os.path.basename(it.file) == LEVEL_INIT_BODY_FILE):
+            # First instruction of the level-init body (PRG008_A242): a genuine level load
+            # starts here every time (fresh levels, death re-entry, sub-area changes). The
+            # body is only ever entered through Level_Initialize itself - the disassembly
+            # has no branch into it and no other routine calls it - so an APU-re-run sandbox
+            # pass (widescreen drawer re-runs) can never execute this instruction to skip a
+            # rollback; if a source refresh ever adds such a path, it must also guard this
+            # sink so it does not fire inside a re-run.
+            be.out("m.reset_sfx_apu();  // level load: the sfx voice set starts clean")
         if mode == "abs" and val == 0x4015 and SND_PAUSE_RANGE[0] <= it.addr < SND_PAUSE_RANGE[1]:
             be.out("m.cyc += %d; { uint8_t keep = m.snd_owner; m.snd_owner = %d; m.wr(0x4015, m.%s); "
                    "m.snd_owner = keep; }" % (cy, SND_BOTH, reg))
@@ -1278,12 +1300,31 @@ def main():
         if name not in syms:
             sys.exit("pause routine label %s not found in source" % name)
     SND_PAUSE_RANGE[:] = [syms["SndPause"], syms["Sound_Process"]]
+    global LEVEL_INIT_BODY_ADDR, LEVEL_INIT_BODY_FILE
+    if "Level_Initialize" not in syms:
+        sys.exit("Level_Initialize label not found in source")
+    # The hook sits at the first instruction of the init body, after the routine's own
+    # early-out ("already initialised"): exactly where a genuine load starts, however the
+    # caller arrived. The body label's instruction must be that unique store so a future
+    # disassembly refresh cannot silently detach the hook from the load path.
+    body_label = "PRG008_A242"
+    if body_label not in syms:
+        sys.exit("level-init body label %s not found in source" % body_label)
+    LEVEL_INIT_BODY_ADDR = syms[body_label]
+    cands = [it for it in items if it.kind == "instr" and it.addr == LEVEL_INIT_BODY_ADDR
+             and it.mn == "STA" and it.operand == "Level_ChangeReset"]
+    if len(cands) != 1:
+        sys.exit("level-init body site not unique: %d STA Level_ChangeReset at $%04X"
+                 % (len(cands), LEVEL_INIT_BODY_ADDR))
+    LEVEL_INIT_BODY_FILE = os.path.basename(cands[0].file)
 
     checked, mismatches = verify(items, syms, rom)
     print("verified %d items against ROM; mismatches: %d" % (checked, len(mismatches)))
     print("deliberate deviations (music gates removed): %d of %d expected" % (len(GATED_ITEMS), len(GATE_TARGETS)))
     if len(GATED_ITEMS) != len(GATE_TARGETS):
         sys.exit("expected %d music gates, found %d" % (len(GATE_TARGETS), len(GATED_ITEMS)))
+    print("level-init sfx reset: hooked at the init body ($%04X in %s), 1 site"
+          % (LEVEL_INIT_BODY_ADDR, LEVEL_INIT_BODY_FILE))
     for kind, it, got, exp in mismatches[:25]:
         print("  MISMATCH %s %s:%d addr=$%04X bank=%s  %s\n    emitted=%s\n    rom    =%s" % (
             kind, it.file, it.line, it.addr or 0, it.bank, it.text,
