@@ -67,6 +67,7 @@ add_custom_target(smb3_translate DEPENDS ${GENERATED_BANKS} "${GEN_DIR}/bank_tab
 add_library(smb3_core STATIC
     src/runtime/machine.cpp
     src/runtime/ppu.cpp
+    src/runtime/hud.cpp
     src/runtime/wide.cpp
     src/runtime/apu.cpp
     src/runtime/nes_apu/Blip_Buffer.cpp

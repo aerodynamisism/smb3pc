@@ -1,6 +1,7 @@
 #include "runtime/machine.h"
 
 #include <algorithm>
+#include <climits>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -57,6 +58,7 @@ void Machine::reset() {
 // ---------------------------------------------------------------- I/O space
 
 uint8_t Machine::rd_io(uint16_t addr) {
+    if (sandbox && addr < 0x6000) return 0;  // a drawer is being re-run: no side effects
     if (addr < 0x4000) {
         ppu_sync();
         switch (addr & 7) {
@@ -105,6 +107,7 @@ uint8_t Machine::rd_io(uint16_t addr) {
 }
 
 void Machine::wr_io(uint16_t addr, uint8_t val) {
+    if (sandbox) return;  // a drawer is being re-run: no PPU/APU/DMA side effects
     if (addr < 0x4000) {
         ppu_sync();
         switch (addr & 7) {
@@ -160,6 +163,8 @@ void Machine::wr_io(uint16_t addr, uint8_t val) {
         return;
     }
     if (addr == 0x4014) {  // OAM DMA: 256 bytes from CPU page, 513/514 cycles
+        // The sprite staging area is $0200; a plant held over a skipped frame is written there first.
+        if (val == 0x02) sprite_hold_before_dma();
         uint16_t page = static_cast<uint16_t>(val << 8);
         for (int i = 0; i < 256; i++) oam[(oamaddr + i) & 0xFF] = rd(static_cast<uint16_t>(page + i));
         oam_dma_snapshot();
@@ -172,8 +177,14 @@ void Machine::wr_io(uint16_t addr, uint8_t val) {
         return;
     }
     if (addr <= 0x4017) {  // APU registers ($4000-$4013, $4015, $4017)
-        // The frame counter is shared by both voice sets; everything else goes to the owner's.
-        if (addr == 0x4017 || snd_owner == kSndBoth) {
+        // The frame counter ($4017) is hardware-global. The enables register ($4015) is routed by
+        // owner, but a write that clears every channel is a "stop everything" gesture: the map's
+        // level-entry halt writes $4015=$00 from the sfx side, and if it did not reach both sets
+        // the music set would keep its last note ringing through the whole transition. (The pause
+        // routine's $4015 writes get the same treatment in translate.py.) The $0F that usually
+        // follows stays per-owner.
+        if (addr == 0x4017 || snd_owner == kSndBoth ||
+            (addr == 0x4015 && val == 0x00 && snd_owner == kSndSfx)) {
             apu.write(addr, val, cyc);
             sfx_apu.write(addr, val, cyc);
         } else if (snd_owner == kSndSfx) {
@@ -409,6 +420,7 @@ void Machine::ppu_step() {
     }
     if (line == kPrerenderLine && dot == 1) {
         hud_top = kNoHud;
+        frame_scroll_set = false;  // the next frame's camera is captured on its first line
         vblank = false;
         sprite0_hit = false;
         sprite_overflow = false;
@@ -445,6 +457,270 @@ void Machine::oam_dma_snapshot() {
     p.base = static_cast<uint8_t>(rd(smb3::Player_SprOff) & 0xFC);
     p.x = static_cast<uint16_t>(rd(smb3::Player_X) | (rd(smb3::Player_XHi) << 8));
     p.y = static_cast<uint16_t>(rd(smb3::Player_Y) | (rd(smb3::Player_YHi) << 8));
+}
+
+// Re-run one object's drawer so that it draws every piece, and keep the pieces for the wide pass.
+// Called from the object loop right after the object's own state action (see translate.py's
+// WIDE_CALLS), where X is the slot and the mapper holds that object's banks - the two things a
+// later re-run cannot reconstruct. The position to re-run from comes from the OAM DMA snapshot
+// (spr_ents) rather than from RAM: the state action draws first and moves afterwards, so RAM
+// already holds where the object will be next frame, and a piece the drawer places against the
+// level instead of against the object (a piranha plant's pipe mask sits on the pipe's own row)
+// would be measured from a position the frame never drew with - the mask came back one row low
+// and the plant's head showed through the pipe's rim. The state action starts by recomputing the
+// object's horizontal and vertical visibility from where it sits on screen
+// (Object_DetermineVertVis/HorzVis), so clearing those bits is not enough: the re-run is given the
+// scrolls that put the object at 100,100, where no piece of it is off-screen and nothing is culled.
+// That matters because a drawer skips a piece by skipping its Y-byte store, and some drawers then
+// read the missing value back (a troopa's head is drawn only when the body under it was), so a
+// partly culled draw would hand back a stale mix. It also makes the result independent of the
+// frame's edge: an object half past it keeps every piece on the frames where it sits a pixel
+// further out, instead of losing exactly those pieces - which is what made sprites flicker at
+// the picture's edge.
+//
+// The re-run draws into a scratch sprite region rather than the one the game used for this object:
+// the region rotates every frame and a drawer may shift its own copy first (a piranha plant adds 8
+// so two sprites fit in front of it), which is how a sprite ends up past OAM's end and disappears
+// for a frame. Only the pieces' contents and their order matter, and the order is kept.
+//
+// Everything the re-run touches is put back afterwards: RAM (including the staging area and the
+// audio routing table), the registers, the cycle and event counters, the mapper and the frame's
+// sprite records. The game never sees the second run; only wide_pieces[] survives it.
+void Machine::wide_after_state_action() {
+    const int slot = x & 7;
+    wide_piece_count[slot] = 0;
+    wide_piece_valid[slot] = false;
+    if (!wide_enabled || sandbox) return;
+    if (rd(smb3::World_EnterState) != 3) return;  // only inside a level
+    if (rd(static_cast<uint16_t>(smb3::Objects_State + slot)) == 0) return;  // dead or empty
+
+    // The position the frame's own draw used, snapshotted with the frame in `oam` (see above). A
+    // slot the snapshot does not have alive was not drawn this frame at all, and the wide pass
+    // skips it for the same reason, so there is nothing to keep.
+    const SprEntity& snap = spr_ents[slot];
+    if (!snap.on) return;
+
+    const int cam = ram[smb3::Horz_Scroll & 0x7FF] | (ram[smb3::Horz_Scroll_Hi & 0x7FF] << 8);
+    const int obj_x = snap.x;
+    const int obj_y = snap.y;
+    const int sx = obj_x - cam;
+    // Wholly inside the pasted frame (the widest object is kWideBox pixels): the frame already
+    // shows it and the wide pass never asks for its pieces. The two pixels of margin absorb the
+    // difference between the live scroll read here and the frame's captured scroll, so an object
+    // the wide pass wants pieces for was always re-run a frame or two early.
+    const int inside_lo = kWideCrop + 2, inside_hi = 256 - kWideCrop - 2;
+    if (sx >= inside_lo && sx + kWideBox <= inside_hi) return;
+    // Outside the wide picture itself (the frame reaches kWideExtra pixels to either side).
+    if (sx + kWideBox <= -kWideExtra || sx >= kWideW - kWideExtra) return;
+
+    struct Saved {
+        uint8_t a, x, y, s, p;
+        uint16_t pc;
+        int64_t cyc, evt;
+        uint8_t snd_owner;
+        bool sandbox;
+        uint8_t prg_slot[4], chr_slot[8];
+        uint8_t mmc3_sel, mmc3_r[8], prg_mode, chr_inv;
+        bool irq_enable, irq_reload, irq_line;
+        uint8_t irq_latch, irq_counter;
+        uint8_t spr_y_rec[64], spr_y_frame[64];
+        uint64_t spr_y_seen;
+        uint8_t ram[0x800];
+        uint8_t snd_sav[256];
+    } sv;
+    sv.a = a; sv.x = x; sv.y = y; sv.s = s; sv.p = p; sv.pc = pc;
+    sv.cyc = cyc; sv.evt = evt; sv.snd_owner = snd_owner; sv.sandbox = sandbox;
+    std::memcpy(sv.prg_slot, prg_slot, 4);
+    std::memcpy(sv.chr_slot, chr_slot, 8);
+    sv.mmc3_sel = mmc3_sel;
+    std::memcpy(sv.mmc3_r, mmc3_r, 8);
+    sv.prg_mode = prg_mode; sv.chr_inv = chr_inv;
+    sv.irq_enable = irq_enable; sv.irq_reload = irq_reload; sv.irq_line = irq_line;
+    sv.irq_latch = irq_latch; sv.irq_counter = irq_counter;
+    std::memcpy(sv.spr_y_rec, spr_y_rec, sizeof spr_y_rec);
+    std::memcpy(sv.spr_y_frame, spr_y_frame, sizeof spr_y_frame);
+    sv.spr_y_seen = spr_y_seen;
+    std::memcpy(sv.ram, ram, sizeof ram);
+    std::memcpy(sv.snd_sav, snd_sav, sizeof snd_sav);
+
+    // The second draw writes into a scratch sprite region instead of the one the game used. The
+    // game's region rotates every frame and a drawer may shift its own copy first (a piranha
+    // plant adds 8 to its own SprRAM so two sprites fit in front of it), which is exactly how a
+    // sprite ends up past OAM's end and disappears for a frame. Only the pieces' contents and
+    // their order matter here, so the drawer gets a window with room for everything it writes:
+    // eight bytes before its region (a troopa's head) and the flight of feet after its sprites.
+    const int base = ram[(smb3::Object_SprRAM + slot) & 0x7FF] & 0xFC;
+    constexpr int kScratch = 0x80;
+    constexpr int kScratchLo = kScratch - 48;
+    constexpr int kScratchHi = kScratch + 64;
+    ram[(smb3::Object_SprRAM + slot) & 0x7FF] = kScratch;
+    for (int off = kScratchLo; off < kScratchHi; off++) ram[0x200 + off] = 0xF8;
+
+    ram[(smb3::Objects_SprHVis + slot) & 0x7FF] = 0;
+    ram[(smb3::Objects_SprVVis + slot) & 0x7FF] = 0;
+    // Rewind the object to the position its own draw used (see the note above): the state action
+    // has moved it since, and the pieces are placed against the snapshotted position.
+    ram[(smb3::Objects_X + slot) & 0x7FF] = static_cast<uint8_t>(obj_x);
+    ram[(smb3::Objects_XHi + slot) & 0x7FF] = static_cast<uint8_t>(obj_x >> 8);
+    ram[(smb3::Objects_Y + slot) & 0x7FF] = static_cast<uint8_t>(obj_y);
+    ram[(smb3::Objects_YHi + slot) & 0x7FF] = static_cast<uint8_t>(obj_y >> 8);
+    // Put the object in the middle of the screen for the re-run, both ways. The state action starts
+    // with Object_DetermineVertVis / Object_DetermineHorzVis (PRG000.asm:2071), which recompute the
+    // visibility bits from the object's screen position, so clearing them is not enough: an object
+    // half past the frame's edge would still lose exactly the pieces the wide picture needs, and it
+    // would lose them only on the frames where it sits a pixel further out - that is the sprite
+    // flicker at the frame's edge. With the object at 100,100 every piece it draws is on-screen.
+    const int draw_cam = obj_x - 100;
+    const int draw_vscroll = obj_y - 100;
+    ram[smb3::Horz_Scroll & 0x7FF] = static_cast<uint8_t>(draw_cam & 0xFF);
+    ram[smb3::Horz_Scroll_Hi & 0x7FF] = static_cast<uint8_t>((draw_cam >> 8) & 0xFF);
+    ram[smb3::Level_VertScroll & 0x7FF] = static_cast<uint8_t>(draw_vscroll & 0xFF);
+    ram[smb3::Level_VertScrollH & 0x7FF] = static_cast<uint8_t>((draw_vscroll >> 8) & 0xFF);
+    ram[smb3::Vert_Scroll & 0x7FF] = static_cast<uint8_t>(draw_vscroll & 0xFF);
+
+    constexpr uint16_t kSentinel = 0x8000;  // where the sandboxed call "returns"
+    sandbox = true;
+    x = static_cast<uint8_t>(slot);
+    a = 0;
+    p = 0x24;
+    s = static_cast<uint8_t>(sv.s - 2);
+    push16(static_cast<uint16_t>(kSentinel - 1));  // RTS lands on the sentinel
+    evt = INT64_MAX;  // the generated code re-dispatches forever if an event is "due"
+    uint16_t at = smb3::Object_DoStateAction;
+    for (int steps = 0; steps < 20000; steps++) {
+        if (at == kSentinel) break;
+        at = dispatch(at);
+    }
+
+    // Reduce the pieces to a position relative to the object, measured with the camera and
+    // vertical scroll the drawer itself used: the wide pass places them against the frame, whose
+    // scroll may be a few pixels different (the game advances Horz_Scroll before it draws).
+    int n = 0;
+    // Relative to where the drawer itself put the object (the re-run's shifted screen).
+    const int obj_sx = obj_x - draw_cam, obj_sy = obj_y - draw_vscroll;
+    for (int off = kScratchLo; off < kScratchHi && n < kWidePieces; off += 4) {
+        const uint8_t ry = ram[0x200 + off];
+        if (ry == 0xF8 || ry >= 239) continue;
+        const int8_t dx = static_cast<int8_t>(static_cast<uint8_t>(ram[0x200 + off + 3] - obj_sx));
+        const int8_t dy = static_cast<int8_t>(static_cast<uint8_t>(ry - obj_sy));
+        // A drawer's pieces sit within 64 pixels of its own origin; anything farther is a stale
+        // byte from another writer of the scratch window.
+        if (dx < -64 || dx > 64 || dy < -64 || dy > 64) continue;
+        // Keep the order the pieces would have in the game's own sprite rotation, so sprites of
+        // different objects still stack as the hardware would stack them. The offset from the
+        // scratch region back to the drawer's real region is signed: a piece written before the
+        // region (a troopa's head at -8, a piranha's pipe mask at -8/-4) has to stay ahead of the
+        // pieces written after it, and folding it to 0 would tie it with the first piece at the
+        // region's start, leaving the two in an arbitrary paint order that changes from frame to
+        // frame - which is what made a plant's pipe mask blink off its body.
+        const int order = base + off - kScratch;
+        wide_pieces[slot][n] = WidePiece{dx, dy, ram[0x200 + off + 1], ram[0x200 + off + 2], order};
+        n++;
+    }
+    // A plant's skipped frame: its drawer wrote nothing, so the pieces it drew on the last frame are
+    // held (sprite_hold_before_dma writes the same ones into the frame), and the wide pass uses those.
+    if (n == 0 && held_valid[slot] && plant_skip_phase(slot)) {
+        for (int k = 0; k < held_count[slot]; k++) {
+            WidePiece w = held_pieces[slot][k];
+            w.slot = base + w.slot;  // the region this frame's drawer uses (see sprite_hold_before_dma)
+            wide_pieces[slot][k] = w;
+        }
+        n = held_count[slot];
+    }
+    wide_piece_count[slot] = static_cast<uint8_t>(n);
+    wide_piece_valid[slot] = true;
+
+    a = sv.a; x = sv.x; y = sv.y; s = sv.s; p = sv.p; pc = sv.pc;
+    cyc = sv.cyc; evt = sv.evt; snd_owner = sv.snd_owner; sandbox = sv.sandbox;
+    std::memcpy(prg_slot, sv.prg_slot, 4);
+    std::memcpy(chr_slot, sv.chr_slot, 8);
+    mmc3_sel = sv.mmc3_sel;
+    std::memcpy(mmc3_r, sv.mmc3_r, 8);
+    prg_mode = sv.prg_mode; chr_inv = sv.chr_inv;
+    irq_enable = sv.irq_enable; irq_reload = sv.irq_reload; irq_line = sv.irq_line;
+    irq_latch = sv.irq_latch; irq_counter = sv.irq_counter;
+    std::memcpy(spr_y_rec, sv.spr_y_rec, sizeof spr_y_rec);
+    std::memcpy(spr_y_frame, sv.spr_y_frame, sizeof spr_y_frame);
+    spr_y_seen = sv.spr_y_seen;
+    std::memcpy(ram, sv.ram, sizeof ram);
+    std::memcpy(snd_sav, sv.snd_sav, sizeof snd_sav);
+}
+
+// Piranha plants hold their last drawn pieces over the frame their drawer skips (see machine.h). Runs
+// once per frame, just before the staging buffer is DMAed to OAM. A plant whose region was written this
+// frame has its pieces recorded, relative to its own screen position, so they can be replayed on the
+// frame that skips. On a skipped frame (no sprite-Y store into its region) the recorded pieces are
+// written back, and their Y stores are reported to the sprite records, so the widescreen pass treats
+// them like any drawn piece. A held frame is not followed by another, so a plant never freezes.
+bool Machine::plant_skip_phase(int s) const {
+    const uint8_t flip = ram[smb3::Objects_FlipBits + s];
+    return ((ram[smb3::Objects_Var4 + s] + ((flip & 0x80) ? 2 : 0)) & 3) == 0;
+}
+
+void Machine::sprite_hold_before_dma() {
+    // The scroll the game's drawers used this frame, as the object positions are made relative to it.
+    const int cam = ram[smb3::Horz_Scroll & 0x7FF] | (ram[smb3::Horz_Scroll_Hi & 0x7FF] << 8);
+    const int vscroll = ram[smb3::Level_VertScroll & 0x7FF] | (ram[smb3::Level_VertScrollH & 0x7FF] << 8);
+    for (int s = 0; s < 8; s++) {
+        const uint8_t id = ram[smb3::Level_ObjectID + s];
+        const bool plant = id >= 0xA0 && id <= 0xA7 && ram[smb3::Objects_State + s] != 0;
+        if (!plant) {
+            held_valid[s] = false;
+            continue;
+        }
+        if (held_id[s] != id) {
+            held_valid[s] = false;
+            held_id[s] = id;
+        }
+        const int base = ram[smb3::Object_SprRAM + s] & 0xFC;
+        // The mask sprites sit 8 and 4 bytes before the region, the plant's own sprites after it. The
+        // sprite index is a byte, so a region near the top of OAM wraps to its bottom, as the game's own
+        // writes do; every offset below is taken modulo 256.
+        const int obj_sx = (ram[smb3::Objects_XHi + s] << 8 | ram[smb3::Objects_X + s]) - cam;
+        const int obj_sy = (ram[smb3::Objects_YHi + s] << 8 | ram[smb3::Objects_Y + s]) - vscroll;
+        if (!plant_skip_phase(s)) {
+            // A drawn frame: keep its pieces, relative to the region, so a later skipped frame can place them.
+            // A drawn frame with no pieces (the plant is past the frame's edge) keeps the last pieces it had,
+            // so a skipped frame that brings the plant back inside the picture still draws them.
+            if (wide_enabled && wide_piece_valid[s] && wide_piece_count[s] > 0) {
+                // The widescreen re-run already has every piece the drawer computed, visible or not.
+                held_count[s] = wide_piece_count[s];
+                for (int k = 0; k < held_count[s]; k++) {
+                    held_pieces[s][k] = wide_pieces[s][k];
+                    held_pieces[s][k].slot = wide_pieces[s][k].slot - base;
+                }
+            } else {
+                int n = 0;
+                for (int rel = -8; rel < 24 && n < kWidePieces; rel += 4) {
+                    const int off = (base + rel) & 0xFF;
+                    const uint8_t ry = ram[0x200 + off];
+                    if (ry >= 239) continue;  // hidden or below the picture
+                    const int8_t dx = static_cast<int8_t>(static_cast<uint8_t>(ram[0x200 + off + 3] - obj_sx));
+                    const int8_t dy = static_cast<int8_t>(static_cast<uint8_t>(ry - obj_sy));
+                    if (dx < -64 || dx > 64 || dy < -64 || dy > 64) continue;
+                    held_pieces[s][n++] = WidePiece{dx, dy, ram[0x200 + off + 1], ram[0x200 + off + 2], rel};
+                }
+                if (n > 0) held_count[s] = static_cast<uint8_t>(n);
+            }
+            held_valid[s] = true;
+        } else if (held_valid[s]) {
+            // Skipped frame: the game drew nothing for the plant, so write its last drawn pieces into this frame's region.
+            for (int k = 0; k < held_count[s]; k++) {
+                const WidePiece& w = held_pieces[s][k];
+                const int off = (base + w.slot) & 0xFF;
+                // Only pieces on the 256-pixel frame: the game never writes a piece that lies outside it,
+                // and a wrapped X would show it on the wrong side.
+                const int px = obj_sx + w.dx, py = obj_sy + w.dy;
+                if (px < 0 || px > 248 || py < 0 || py >= 239) continue;
+                const uint16_t ea = static_cast<uint16_t>(0x200 + off);
+                ram[ea] = static_cast<uint8_t>(py);
+                ram[ea + 1] = w.tile;
+                ram[ea + 2] = w.attr;
+                ram[ea + 3] = static_cast<uint8_t>(px);
+                spr_y_record(ea, ram[ea]);
+            }
+        }
+    }
 }
 
 void Machine::run_frame() {

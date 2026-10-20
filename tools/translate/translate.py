@@ -1000,9 +1000,13 @@ def emit_alu_real(be, real, it):
     cy = base_cycles(real, fm)
     be.out("m.cyc += %d;" % cy)
     if fm == "imm":
-        be.out("m.%s(0x%02X);" % ("adc" if real == "ADC" else "sbc", value & 0xFF))
+        arg = "0x%02X" % (value & 0xFF)
     else:
-        be.out("m.%s(%s);" % ("adc" if real == "ADC" else "sbc", read_expr(fm, value, True)))
+        arg = read_expr(fm, value, True)
+    # The object window hooks wrap the added value, not the instruction (WIDE_TUNE).
+    if it.addr in WIDE_TUNE:
+        arg = "m.%s(%s)" % (WIDE_TUNE[it.addr], arg)
+    be.out("m.%s(%s);" % ("adc" if real == "ADC" else "sbc", arg))
 
 
 def emit_branch(be, mn, a, tgt, records=None):
@@ -1174,8 +1178,12 @@ def emit_real(be, mn, mode, it, data, tgt):
             # has no branch into it and no other routine calls it - so an APU-re-run sandbox
             # pass (widescreen drawer re-runs) can never execute this instruction to skip a
             # rollback; if a source refresh ever adds such a path, it must also guard this
-            # sink so it does not fire inside a re-run.
+            # sink so it does not fire inside a re-run. The widescreen object window resets
+            # here too: this is the only reliable level-load signal (the game's own
+            # Level_ObjectsSpawned array is empty again whenever the last live object of a
+            # level has been deleted, which happens mid-level).
             be.out("m.reset_sfx_apu();  // level load: the sfx voice set starts clean")
+            be.out("m.wide_level_load();  // level load: the object window restarts")
         if mode == "abs" and val == 0x4015 and SND_PAUSE_RANGE[0] <= it.addr < SND_PAUSE_RANGE[1]:
             be.out("m.cyc += %d; { uint8_t keep = m.snd_owner; m.snd_owner = %d; m.wr(0x4015, m.%s); "
                    "m.snd_owner = keep; }" % (cy, SND_BOTH, reg))
@@ -1196,7 +1204,11 @@ def emit_real(be, mn, mode, it, data, tgt):
     if mn in ("ADC", "SBC"):
         pen = mode in ("absx", "absy", "indy")
         fn = "adc" if mn == "ADC" else "sbc"
-        be.out("m.cyc += %d; m.%s(%s);" % (cy, fn, read_expr(mode, val, pen)))
+        arg = read_expr(mode, val, pen)
+        # A plain ADC can carry a WIDE_TUNE hook too (the delete table's high-byte add).
+        if it.addr in WIDE_TUNE:
+            arg = "m.%s(%s)" % (WIDE_TUNE[it.addr], arg)
+        be.out("m.cyc += %d; m.%s(%s);" % (cy, fn, arg))
         return
     if mn in ("CMP", "CPX", "CPY"):
         reg = {"CMP": "a", "CPX": "x", "CPY": "y"}[mn]
@@ -1225,6 +1237,31 @@ def emit_real(be, mn, mode, it, data, tgt):
         return
     raise RuntimeError("unsupported mnemonic %s in %s:%d" % (mn, it.file, it.line))
 
+
+# Widescreen object window. The game creates an object when the camera's look-ahead column
+# (Horz_Scroll + 272) reaches it and removes it again once it is 288-384 pixels ahead of the
+# camera, or 48-128 pixels behind it; the wide picture shows 341 pixels to the right and 85 to
+# the left of the camera, so in widescreen both edges of that window move out by 96
+# (Machine::wide_spawn_lookahead / wide_delete_ahead). The left-hand deletion distance is what
+# makes an enemy pop in 16:9: 48-80 pixels behind the frame is inside the added columns.
+# The delete distance is a low-byte add (PRG000_D3CC) and a separate high-byte add
+# (PRG000_D3D2); the widened low byte can carry past 256, so the high-byte hook adds that
+# carry (wide_delete_ahead_hi), otherwise the plant's row (N2) is removed 256 pixels early.
+# The instructions are unchanged and the hooks return their input in 4:3, so the ROM still
+# verifies byte for byte; only the widescreen presentation window differs.
+WIDE_TUNE = {
+    0xB83A: "wide_spawn_lookahead",   # PRG/prg005.asm:4925  ADD LOSBS_LookAhead,Y
+    0xD411: "wide_delete_ahead",      # PRG/prg000.asm:4234  ADD PRG000_D3CC,Y
+    0xD41E: "wide_delete_ahead_hi",   # PRG/prg000.asm:4243  ADC PRG000_D3D2,Y
+}
+
+# Hooks that run once per object, at the point where the object loop regains control: the
+# return address of the JSR into the object's state action, i.e. the instruction right after
+# it. At that moment X is the object's slot and the mapper holds the object's banks, so the
+# wide pass can re-run that one drawer without guessing at either.
+WIDE_CALLS = {
+    0xC9C5: "wide_after_state_action",  # PRG/prg000.asm:1911  right after JSR Object_DoStateAction
+}
 
 SYMS_REF = [None]
 SPR_SITES = [0, 0]  # [branches over sprite Y stores, stores they skip]
@@ -1257,6 +1294,12 @@ def emit_bank(bank, origin, items):
             # Fresh emitter buffer per instruction, then splice
             sub = BankEmitter(labels)
             emit_instr(sub, it, data, mode, tgt, culls.get(it.addr))
+            if it.addr in WIDE_CALLS:
+                # The hook belongs after the label, i.e. at the moment the call returns here.
+                for i, line in enumerate(sub.lines):
+                    if line.startswith("L_"):
+                        sub.lines.insert(i + 1, "  m.%s();" % WIDE_CALLS[it.addr])
+                        break
             lines.extend("  " + l if not l.startswith("L_") else l for l in sub.lines)
     lines.append("  return %s;  // fall out of the bank window" % hexa(origin + 0x2000))
     lines.append("}")

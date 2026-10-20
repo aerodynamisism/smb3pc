@@ -235,14 +235,38 @@ bool parse_poke(const std::string& spec, std::vector<Poke>* pokes) {
     return true;
 }
 
-void poke_byte(Machine& m, uint16_t addr, uint8_t val) {
+void poke_byte(Machine& m, uint16_t addr, uint8_t val, int apu_owner) {
     if (addr < 0x2000) m.ram[addr & 0x7FF] = val;
     else if (addr >= 0x6000 && addr < 0x8000) m.sram[addr - 0x6000] = val;
+    else if (addr == 0x2000 || (addr >= 0x4000 && addr <= 0x4017)) {
+        // Hardware writes route by snd_owner like the game's own writes; --poke-apu can force
+        // a specific voice set (the game reflects ownership only while a sound routine runs,
+        // so frame-boundary injection needs the override).
+        if (apu_owner < 0) m.wr(addr, val);
+        else {
+            uint8_t keep = m.snd_owner;
+            m.snd_owner = static_cast<uint8_t>(apu_owner);
+            m.wr(addr, val);
+            m.snd_owner = keep;
+        }
+    }
 }
 
 void print_state(Machine& m, int frame) {
     const auto rd16 = [&](uint16_t lo, uint16_t hi) { return m.rd(lo) | (m.rd(hi) << 8); };
-    std::printf("state f%05d: enter=%u tileset=%u width=%u vert7=%u cam=$%04X vscroll=$%04X "
+    std::printf("objs=");
+    for (int i = 0; i < 8; i++) {
+        std::printf("%d:(x%01X%02X,y%01X%02X,v4=%02X,v5=%01X%02X,st=%02X,id=%02X,ey=%01X%02X)", i,
+                    m.ram[smb3::Objects_XHi + i], m.ram[smb3::Objects_X + i],
+                    m.ram[smb3::Objects_YHi + i], m.ram[smb3::Objects_Y + i],
+                    m.ram[smb3::Objects_Var4 + i],
+                    m.ram[smb3::Objects_Var7 + i], m.ram[smb3::Objects_Var5 + i],
+                    m.ram[smb3::Objects_State + i], m.ram[smb3::Level_ObjectID + i],
+                    m.spr_ents[i].y >> 8, m.spr_ents[i].y & 0xFF);
+    }
+    std::printf(" pad press=%02X hold=%02X in=%02X own=%d", m.rd(smb3::Controller1Press),
+                m.rd(smb3::Pad_Holding), m.rd(smb3::Pad_Input), m.snd_owner);
+    std::printf(" state f%05d: enter=%u tileset=%u width=%u vert7=%u cam=$%04X vscroll=$%04X "
                 "player=$%04X/$%04X psx=%d psy=%d mappos=$%04X/%04X maptile=$%02X mapop=$%02X "
                 "pan=$%02X mapmove=$%02X lives=%u endl=%u halt=%u exitmap=%u mret=%u inair=%u "
                 "suit=%u padh=$%02X padi=$%02X dying=%u hgame=%u pipe=%u vibe=%u xvel=%d yvel=%d "
@@ -315,10 +339,13 @@ int main(int argc, char** argv) {
     std::vector<int> shot_frames;
     std::vector<std::pair<int, int>> script;
     std::vector<Poke> pokes;
+    int poke_apu_owner = -1;  // -1 = route like the game's own writes
     int frames = 300;
+    bool frames_given = false;
     int press_start_at = -1;
     int press_start_len = 6;
     bool widescreen = false;
+    std::string replay_path;  // desktop --record file: one controller byte per frame
     bool dump_state = false;
     bool dump_level = false;
     int trace_every = 0;
@@ -326,10 +353,14 @@ int main(int argc, char** argv) {
         std::string arg = argv[i];
         if (arg == "--assets" && i + 1 < argc) assets = argv[++i];
         else if (arg == "--out" && i + 1 < argc) out = argv[++i];
-        else if (arg == "--frames" && i + 1 < argc) frames = std::atoi(argv[++i]);
+        else if (arg == "--frames" && i + 1 < argc) {
+            frames = std::atoi(argv[++i]);
+            frames_given = true;
+        }
         else if (arg == "--press-start" && i + 1 < argc) press_start_at = std::atoi(argv[++i]);
         else if (arg == "--wav" && i + 1 < argc) wav_out = argv[++i];
         else if (arg == "--widescreen") widescreen = true;
+        else if (arg == "--replay" && i + 1 < argc) replay_path = argv[++i];
         else if (arg == "--dump-state") dump_state = true;
         else if (arg == "--dump-level") dump_level = true;
         else if (arg == "--trace" && i + 1 < argc) trace_every = std::atoi(argv[++i]);
@@ -346,6 +377,12 @@ int main(int argc, char** argv) {
                 std::fprintf(stderr, "bad --poke spec (want \"f1[-f2]:addr=val,...\")\n");
                 return 1;
             }
+        } else if (arg == "--poke-apu" && i + 1 < argc) {
+            std::string t = argv[++i];
+            if (t == "music") poke_apu_owner = Machine::kSndMusic;
+            else if (t == "sfx") poke_apu_owner = Machine::kSndSfx;
+            else if (t == "both") poke_apu_owner = Machine::kSndBoth;
+            else if (t != "game") { std::fprintf(stderr, "--poke-apu wants game|music|sfx|both\n"); return 1; }
         } else {
             std::fprintf(stderr, "unrecognized argument: %s\n", arg.c_str());
             return 1;
@@ -354,6 +391,17 @@ int main(int argc, char** argv) {
     if (!script_spec.empty() && !parse_script(script_spec, &script)) {
         std::fprintf(stderr, "bad --script spec (want \"frame:mask,...\")\n");
         return 1;
+    }
+
+    std::vector<uint8_t> replay;
+    if (!replay_path.empty()) {
+        replay = read_file(replay_path);
+        if (replay.empty()) {
+            std::fprintf(stderr, "cannot read replay %s\n", replay_path.c_str());
+            return 1;
+        }
+        // Play the whole recording unless --frames asks for fewer or more.
+        if (!frames_given) frames = static_cast<int>(replay.size());
     }
 
     std::vector<uint8_t> prg = read_file(assets + "/prg.bin");
@@ -386,8 +434,12 @@ int main(int argc, char** argv) {
         if (press_start_at >= 0 && f >= press_start_at && f < press_start_at + press_start_len) {
             m->joy[0] = 0x08;
         }
+        if (!replay.empty()) {
+            // Past the recording the last frame's pad is held, so a run never falls back to idle input.
+            m->joy[0] = replay[std::min(static_cast<size_t>(f), replay.size() - 1)];
+        }
         for (const Poke& p : pokes) {
-            if (f >= p.first && f <= p.last) poke_byte(*m, p.addr, p.val);
+            if (f >= p.first && f <= p.last) poke_byte(*m, p.addr, p.val, poke_apu_owner);
         }
         m->run_frame();
         if (widescreen) m->wide_compose();  // exactly how the desktop app presents the frame

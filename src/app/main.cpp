@@ -1,10 +1,17 @@
 // Desktop front end: SDL3 window, Vulkan presenter, audio output, keyboard and
 // gamepad input, and frame pacing at the NTSC rate (about 60.0988 Hz).
 //
-//   smb3pc [--assets DIR] [--shaders DIR] [--config FILE]
+//   smb3pc [--assets DIR] [--shaders DIR] [--config FILE] [--record FILE] [--replay FILE]
+//
+// --record FILE writes the controller byte of every emulated frame (one byte per frame, the same
+// bytes headless --replay FILE feeds back). Paused menu frames are not recorded.
+// --replay FILE plays a recording back in this window: its bytes drive the controller, and the
+// program exits when the file runs out. Press G during playback to save the session.
 //
 // Default keys: arrows = D-pad, X = A, Z = B, Enter = Start, Right Shift = Select,
-// F11 = menu (fullscreen, FPS counter, widescreen), Esc = quit. Gamepad: South = A, East = B,
+// F11 = menu (fullscreen, FPS counter, widescreen), G = save the session so far as replay-N.rec and quit
+// (replay with: smb3_headless --replay replay-N.rec, plus --widescreen if the picture was wide),
+// Esc = quit. Gamepad: South = A, East = B,
 // Back = Select, Start = Start, D-pad = D-pad. Remap keys in settings.cfg (see README).
 // Menu settings (fullscreen, FPS counter, widescreen) persist in settings.cfg.
 #include <SDL3/SDL.h>
@@ -118,11 +125,31 @@ int main(int argc, char** argv) {
     std::string assets = SMB3_ASSET_DIR;
     std::string shaders = SMB3_SHADER_DIR;
     std::string config = "settings.cfg";
+    std::string record_path;
+    std::string replay_path;
     for (int i = 1; i < argc; i++) {
         std::string arg = argv[i];
         if (arg == "--assets" && i + 1 < argc) assets = argv[++i];
         else if (arg == "--shaders" && i + 1 < argc) shaders = argv[++i];
         else if (arg == "--config" && i + 1 < argc) config = argv[++i];
+        else if (arg == "--record" && i + 1 < argc) record_path = argv[++i];
+        else if (arg == "--replay" && i + 1 < argc) replay_path = argv[++i];
+    }
+    std::vector<uint8_t> replay;
+    if (!replay_path.empty()) {
+        replay = read_file(replay_path);
+        if (replay.empty()) {
+            std::fprintf(stderr, "cannot read replay %s\n", replay_path.c_str());
+            return 1;
+        }
+    }
+    std::ofstream record;
+    if (!record_path.empty()) {
+        record.open(record_path, std::ios::binary | std::ios::trunc);
+        if (!record) {
+            std::fprintf(stderr, "cannot write %s\n", record_path.c_str());
+            return 1;
+        }
     }
 
     // Menu settings and controller bindings share one file (missing file keeps
@@ -189,6 +216,10 @@ int main(int argc, char** argv) {
         m->reset();
         uint8_t kb_state = 0;   // keyboard contribution to the pad byte
         uint8_t gp_state = 0;   // gamepad contribution
+        // Every emulated frame's controller byte since boot, kept whether or not --record is set,
+        // so G can save the whole session as a replay.
+        std::vector<uint8_t> session_joy;
+        size_t replay_pos = 0;     // next replay byte to play
         bool running = true;
         uint64_t deadline = SDL_GetTicksNS();
         std::vector<int16_t> samples;
@@ -216,6 +247,24 @@ int main(int argc, char** argv) {
             if (!settings::save(config, app_settings)) {
                 std::fprintf(stderr, "cannot write %s\n", config.c_str());
             }
+        };
+        // G: write the session so far to the first free replay-N.rec in the working directory,
+        // then quit (the main loop ends after the current iteration).
+        auto save_replay = [&]() {
+            std::string path;
+            for (int n = 1;; n++) {
+                path = "replay-" + std::to_string(n) + ".rec";
+                if (!std::ifstream(path)) break;
+            }
+            std::ofstream out(path, std::ios::binary | std::ios::trunc);
+            if (!out) {
+                std::fprintf(stderr, "cannot write %s\n", path.c_str());
+                return;
+            }
+            out.write(reinterpret_cast<const char*>(session_joy.data()),
+                      static_cast<std::streamsize>(session_joy.size()));
+            std::fprintf(stderr, "saved %zu frames to %s (%s)\n", session_joy.size(), path.c_str(),
+                         widescreen ? "widescreen" : "4:3");
         };
         int fps_shown = 0;
         int fps_frames = 0;
@@ -281,6 +330,9 @@ int main(int argc, char** argv) {
                         if (down && !ev.key.repeat && ev.key.scancode == SDL_SCANCODE_F11) {
                             menu_open = !menu_open;
                             menu_sel = 0;
+                        } else if (down && !ev.key.repeat && ev.key.scancode == SDL_SCANCODE_G) {
+                            save_replay();
+                            running = false;
                         } else if (down && ev.key.scancode == SDL_SCANCODE_ESCAPE) {
                             running = false;
                         } else if (menu_open && down && !ev.key.repeat) {
@@ -361,7 +413,23 @@ int main(int argc, char** argv) {
                 SDL_DelayNS(10000000);  // 10 ms
                 continue;
             }
-            m->joy[0] = static_cast<uint8_t>(kb_state | gp_state);
+            const uint8_t live = static_cast<uint8_t>(kb_state | gp_state);
+            if (replay_pos < replay.size()) {
+                m->joy[0] = replay[replay_pos++];
+            } else if (!replay.empty()) {
+                // The recording is over: leave the loop without running another frame.
+                std::fprintf(stderr, "replay finished\n");
+                running = false;
+                break;
+            } else {
+                m->joy[0] = live;
+            }
+            session_joy.push_back(m->joy[0]);
+            if (record.is_open()) {
+                // Flushed every frame so a crash or a quit keeps everything played so far.
+                record.put(static_cast<char>(m->joy[0]));
+                record.flush();
+            }
             // One emulated frame per presented image, so motion advances evenly.
             m->run_frame();
             if (widescreen) m->wide_compose();
